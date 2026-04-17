@@ -4,87 +4,90 @@ import requests
 import time
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="NOC Multinet", page_icon="📡", layout="wide")
+st.set_page_config(page_title="NOC Multinet - SmartOLT", page_icon="📡", layout="wide")
 
-# Intentar leer secretos
+# 1. Carga de Secretos con Limpieza
 try:
     URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
     TOKEN = st.secrets["smartolt"]["token"].strip()
 except Exception as e:
-    st.error(f"❌ Error leyendo Secrets: {e}")
+    st.error("❌ No se encontraron los secretos [smartolt] en la configuración.")
     st.stop()
 
 st.title("📡 Dashboard NOC Multinet")
 
-def test_api():
-    # SmartOLT a veces requiere /api/v1/ o solo /api/
-    # Vamos a probar la ruta más estándar
-    url = f"{URL_BASE}/api/onu/get_all"
-    headers = {
-        'X-Token': TOKEN,
-        'Accept': 'application/json'
-    }
+def llamar_smartolt(endpoint):
+    # Usamos el endpoint que encontraste: onu/get_onus_statuses
+    url = f"{URL_BASE}/api/{endpoint}"
+    headers = {'X-Token': TOKEN}
     
-    informe = []
-    
-    # Intento 1: POST
     try:
-        r = requests.post(url, headers=headers, timeout=10)
-        if r.status_code == 200 and r.json().get('status'):
-            return r.json().get('response'), None
-        informe.append(f"POST {r.status_code}: {r.text[:100]}")
-    except Exception as e:
-        informe.append(f"Error POST: {str(e)}")
-
-    # Intento 2: GET (por si tu versión de SmartOLT es distinta)
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200 and r.json().get('status'):
-            return r.json().get('response'), None
-        informe.append(f"GET {r.status_code}: {r.text[:100]}")
-    except Exception as e:
-        informe.append(f"Error GET: {str(e)}")
+        # Probamos con POST (estándar de SmartOLT)
+        r = requests.post(url, headers=headers, timeout=15)
         
-    return None, informe
+        # Si el servidor prefiere GET, hacemos el cambio automático
+        if r.status_code == 405:
+            r = requests.get(url, headers=headers, timeout=15)
+            
+        if r.status_code == 200:
+            res = r.json()
+            if res.get('status'):
+                return res.get('response')
+            else:
+                st.sidebar.warning(f"Respuesta SmartOLT: {res.get('error')}")
+        else:
+            st.sidebar.error(f"Error {r.status_code} en {endpoint}")
+    except Exception as e:
+        st.sidebar.error(f"Error de red: {e}")
+    return None
 
-# --- EJECUCIÓN ---
-with st.spinner('Validando acceso a SmartOLT...'):
-    datos, errores = test_api()
+# --- OBTENCIÓN DE DATOS ---
+with st.spinner('Sincronizando estados de ONUs...'):
+    # CAMBIO CLAVE: Usando el endpoint correcto
+    onus = llamar_smartolt("onu/get_onus_statuses")
+    olts = llamar_smartolt("system/get_olts")
 
-if datos:
-    # --- SI FUNCIONA, MOSTRAR DASHBOARD ---
-    onus = datos
+# --- INTERFAZ ---
+if onus is not None:
+    # Procesar datos
     total = len(onus)
     online = len([o for o in onus if str(o.get('status')).lower() == 'online'])
     offline = total - online
     
+    # Métricas principales
     c1, c2, c3 = st.columns(3)
     c1.metric("Clientes Totales", total)
     c2.metric("Online ✅", online)
     c3.metric("Fallas ❌", offline, delta_color="inverse")
-    
-    st.subheader("🔴 Lista de Clientes Offline")
-    df = pd.DataFrame(onus)
-    df_off = df[df['status'].str.lower() != 'online'].copy()
-    if not df_off.empty:
-        st.dataframe(df_off[['name', 'sn', 'olt_name', 'signal']], use_container_width=True)
-    else:
-        st.success("✅ No hay clientes offline.")
-else:
-    # --- SI FALLA, MOSTRAR DIAGNÓSTICO ---
-    st.error("❌ Fallo total de conexión")
-    with st.expander("🔍 Ver Informe Técnico de Errores"):
-        st.write("Estamos intentando conectar a:", f"`{URL_BASE}/api/onu/get_all` text")
-        for err in errores:
-            st.code(err)
-    
-    st.info("""
-    **¿Qué revisar ahora?**
-    1. Ve a tu panel de SmartOLT -> Settings -> API Key.
-    2. Verifica que el Token sea exactamente el mismo.
-    3. Asegúrate de que **Allowed IPs** diga `0.0.0.0`.
-    4. Si usas Streamlit Cloud, dale al botón **"Reboot App"** (abajo a la derecha) para asegurar que leyó los nuevos secretos.
-    """)
 
-if st.button('🔄 Reintentar'):
-    st.rerun()
+    st.markdown("---")
+
+    # Tabla de fallas
+    st.subheader("🔴 Clientes fuera de línea")
+    df = pd.DataFrame(onus)
+    
+    # En este endpoint, SmartOLT a veces usa nombres de columnas distintos
+    # Filtramos por status != online
+    df_off = df[df['status'].str.lower() != 'online'].copy()
+    
+    if not df_off.empty:
+        # Intentamos mostrar las columnas más útiles
+        columnas_posibles = ['name', 'sn', 'olt_name', 'pon_port', 'signal', 'last_online_at']
+        existentes = [c for c in columnas_posibles if c in df_off.columns]
+        st.dataframe(df_off[existentes], use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ No se detectan clientes offline en este momento.")
+
+    # OLTs
+    if olts:
+        with st.expander("🏢 Estado de Cabeceras (OLTs)"):
+            for o in olts:
+                st.write(f"🖥️ **{o.get('name')}** - Status: {o.get('status')}")
+else:
+    st.error("❌ Conexión fallida.")
+    st.info(f"Estamos consultando a: `{URL_BASE}/api/onu/get_onus_statuses`")
+    st.write("Verifica que el API Key tenga permisos suficientes en el panel de SmartOLT.")
+
+# Refresco automático
+time.sleep(60)
+st.rerun()
