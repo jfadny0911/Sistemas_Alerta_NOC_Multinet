@@ -14,7 +14,7 @@ NOMBRE_SHEET = "Inventario_NOC"
 def conectar_gsheets():
     try: 
         return gspread.service_account(filename='google_creds.json')
-    except Exception as e: 
+    except: 
         return None
 
 def enviar_telegram(mensaje, device_id=None):
@@ -23,14 +23,10 @@ def enviar_telegram(mensaje, device_id=None):
         chat_id = st.secrets["telegram"]["chat_id"]
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
-        
         if device_id:
             payload["reply_markup"] = json.dumps({
-                "inline_keyboard": [[
-                    {"text": "🙋‍♂️ Asignarme", "callback_data": f"asignar_{device_id}"}
-                ]]
+                "inline_keyboard": [[{"text": "🙋‍♂️ Asignarme", "callback_data": f"asignar_{device_id}"}]]
             })
-            
         requests.post(url, json=payload, timeout=10)
         return True
     except: 
@@ -39,20 +35,26 @@ def enviar_telegram(mensaje, device_id=None):
 # --- CABECERA ---
 st.title("🛰️ Dashboard de Clientes y Red - SmartOLT")
 
-# Inicializar sesión para no repetir alertas
 if 'ultima_notif' not in st.session_state:
     st.session_state.ultima_notif = {}
 
-# --- OBTENER DATOS DE SMARTOLT (MÉTODO POST) ---
+# --- PROCESAMIENTO DE URL (LIMPIEZA) ---
+# Esto evita que se duplique el "/api" o las barras "/"
+url_cruda = str(st.secrets['smartolt']['url']).rstrip('/')
+if url_cruda.endswith('/api'):
+    url_base = url_cruda
+else:
+    url_base = f"{url_cruda}/api"
+
+headers = {'X-Token': st.secrets['smartolt']['token']}
+
+# --- OBTENER DATOS DE ONUS (CLIENTES) ---
 onus_data = []
 stats = {"online": 0, "offline": 0, "total": 0}
 
 try:
-    url_base = str(st.secrets['smartolt']['url']).rstrip('/')
-    headers = {'X-Token': st.secrets['smartolt']['token']}
-    
-    # Consulta de ONUs usando POST (Corregido)
-    r_onus = requests.post(f"{url_base}/api/onu/get_all", headers=headers, timeout=40)
+    # IMPORTANTE: Usamos POST y una URL limpia
+    r_onus = requests.post(f"{url_base}/onu/get_all", headers=headers, timeout=40)
     
     if r_onus.status_code == 200:
         res_json = r_onus.json()
@@ -62,12 +64,11 @@ try:
             stats["online"] = len([o for o in onus_data if str(o.get('status')).lower() == 'online'])
             stats["offline"] = stats["total"] - stats["online"]
         else:
-            st.error(f"❌ SmartOLT Error: {res_json.get('error')}")
+            st.error(f"❌ SmartOLT reportó un error: {res_json.get('error')}")
     else:
-        st.error(f"❌ Error de Conexión SmartOLT (Código {r_onus.status_code})")
-
+        st.error(f"❌ Error API ONUs (Código {r_onus.status_code}): {r_onus.text}")
 except Exception as e:
-    st.error(f"❌ Error crítico: {e}")
+    st.error(f"❌ Error de conexión al buscar clientes: {e}")
 
 # --- SECCIÓN 1: MÉTRICAS GENERALES ---
 col1, col2, col3, col4 = st.columns(4)
@@ -92,48 +93,31 @@ with tab1:
     
     if clientes_off:
         df_off = pd.DataFrame(clientes_off)
-        cols_interes = {
-            'name': 'Cliente',
-            'sn': 'Serie ONU',
-            'olt_name': 'OLT',
-            'pon_port': 'Puerto',
-            'signal': 'Señal',
-            'last_online_at': 'Visto Últ. Vez'
+        # Columnas que SmartOLT suele devolver
+        cols_map = {
+            'name': 'Cliente', 'sn': 'Serie ONU', 'olt_name': 'OLT',
+            'pon_port': 'Puerto', 'signal': 'Señal', 'last_online_at': 'Visto Últ. Vez'
         }
-        # Filtrar solo las columnas que existan en el DataFrame
-        existentes = [c for c in cols_interes.keys() if c in df_off.columns]
-        df_display = df_off[existentes].rename(columns=cols_interes)
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        existentes = [c for c in cols_map.keys() if c in df_off.columns]
+        st.dataframe(df_off[existentes].rename(columns=cols_map), use_container_width=True, hide_index=True)
     else:
-        st.success("✅ No se detectan clientes offline.")
+        st.success("✅ No hay clientes offline detectados.")
 
 with tab2:
     st.subheader("Estado de Cabeceras (OLTs)")
     try:
-        r_olts = requests.post(f"{url_base}/api/system/get_olts", headers=headers, timeout=15)
+        r_olts = requests.post(f"{url_base}/system/get_olts", headers=headers, timeout=15)
         if r_olts.status_code == 200:
             olts = r_olts.json().get('response', [])
             for o in olts:
-                state = str(o.get('status')).lower()
-                icon = "🟢" if state == 'online' else "🔴"
-                st.write(f"{icon} **{o.get('name')}** - IP: {o.get('ip')} ({state.upper()})")
-                
-                # Alerta automática si una OLT se cae
-                if state != 'online':
-                    did = f"olt_{o.get('id')}"
-                    ahora = datetime.now()
-                    ultima = st.session_state.ultima_notif.get(did)
-                    if ultima is None or (ahora - ultima) > timedelta(minutes=30):
-                        msg = f"🚨 *OLT CAÍDA:* {o.get('name')}\n🌐 IP: {o.get('ip')}"
-                        if enviar_telegram(msg, device_id=did):
-                            st.session_state.ultima_notif[did] = ahora
+                st.write(f"🖥️ **{o.get('name')}** - IP: {o.get('ip')} - Status: {o.get('status')}")
         else:
-            st.error("No se pudo obtener el estado de las OLTs.")
+            st.error(f"Error OLTs (Código {r_olts.status_code})")
     except:
-        st.error("Falla al conectar con la API de OLTs.")
+        st.error("Falla al conectar con la sección de OLTs.")
 
 with tab3:
-    st.subheader("Registros de Google Sheets")
+    st.subheader("Historial (Google Sheets)")
     gc = conectar_gsheets()
     if gc:
         try:
@@ -141,9 +125,7 @@ with tab3:
             df_logs = pd.DataFrame(sh.worksheet("Log_Fallas").get_all_records())
             st.dataframe(df_logs.tail(20), use_container_width=True)
         except:
-            st.warning("No se pudo cargar el historial desde Google Sheets.")
-    else:
-        st.info("Configura google_creds.json para ver el historial.")
+            st.warning("No se pudo leer el Excel.")
 
 # --- AUTO REFRESH ---
 time.sleep(60)
