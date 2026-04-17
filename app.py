@@ -3,83 +3,86 @@ import pandas as pd
 import requests
 import time
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Multinet NOC", page_icon="📡", layout="wide")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="NOC Multinet", page_icon="📡", layout="wide")
 
-# Limpieza de datos de entrada
+# Limpieza radical de URL y Token
 URL_BASE = str(st.secrets['smartolt']['url']).strip().rstrip('/')
 TOKEN = str(st.secrets['smartolt']['token']).strip()
 
-st.title("📡 Monitor de Red Multinet (SmartOLT)")
+st.title("📡 Monitor de Red Multinet")
 
-def peticion_smartolt(endpoint):
-    """Función centralizada para hablar con SmartOLT"""
+def consulta_inteligente(endpoint):
+    """Prueba GET y POST para encontrar el método correcto del servidor"""
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': TOKEN}
+    
+    # 1. Intentamos con GET
     try:
-        # SmartOLT suele requerir POST para obtener datos
-        r = requests.post(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get('status'):
+        r_get = requests.get(url, headers=headers, timeout=10)
+        if r_get.status_code == 200:
+            data = r_get.json()
+            if data.get('status') == True:
                 return data.get('response')
-        return None
     except:
-        return None
+        pass
+
+    # 2. Si falló el anterior, intentamos con POST
+    try:
+        r_post = requests.post(url, headers=headers, timeout=10)
+        if r_post.status_code == 200:
+            data = r_post.json()
+            if data.get('status') == True:
+                return data.get('response')
+    except:
+        pass
+    
+    return None
 
 # --- OBTENER DATOS ---
-with st.spinner('Sincronizando con SmartOLT...'):
-    onus = peticion_smartolt("onu/get_all")
-    olts = peticion_smartolt("system/get_olts")
+with st.spinner('Conectando con la OLT...'):
+    onus = consulta_inteligente("onu/get_all")
+    olts = consulta_inteligente("system/get_olts")
 
+# --- MOSTRAR RESULTADOS ---
 if onus is not None:
-    # --- MÉTRICAS ---
+    # Métricas
     total = len(onus)
     online = len([o for o in onus if str(o.get('status')).lower() == 'online'])
     offline = total - online
     
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Clientes Totales", total)
-    m2.metric("Online ✅", online)
-    m3.metric("Fallas ❌", offline, delta_color="inverse")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Clientes", total)
+    c2.metric("Online ✅", online)
+    c3.metric("Fallas ❌", offline, delta_color="inverse")
 
-    # --- PESTAÑAS ---
-    tab_clientes, tab_olts = st.tabs(["🔴 Clientes Offline", "🏢 Estado de OLTs"])
+    st.markdown("---")
+    
+    # Tabla de fallas
+    st.subheader("🔴 Detalle de Clientes Offline")
+    df = pd.DataFrame(onus)
+    df_falla = df[df['status'].str.lower() != 'online'].copy()
+    
+    if not df_falla.empty:
+        cols = ['name', 'sn', 'olt_name', 'pon_port', 'signal']
+        existentes = [c for c in cols if c in df_falla.columns]
+        st.dataframe(df_falla[existentes], use_container_width=True, hide_index=True)
+    else:
+        st.success("No hay fallas reportadas.")
 
-    with tab_clientes:
-        df_onus = pd.DataFrame(onus)
-        # Filtramos solo los que no están online
-        df_falla = df_onus[df_onus['status'].str.lower() != 'online'].copy()
-        
-        if not df_falla.empty:
-            # Seleccionamos columnas útiles para el técnico
-            columnas = ['name', 'sn', 'olt_name', 'pon_port', 'signal', 'last_online_at']
-            existentes = [c for c in columnas if c in df_falla.columns]
-            
-            st.dataframe(
-                df_falla[existentes].rename(columns={
-                    'name': 'Cliente', 'sn': 'Serie', 'olt_name': 'OLT', 
-                    'pon_port': 'Puerto', 'signal': 'Señal', 'last_online_at': 'Caída'
-                }),
-                use_container_width=True, hide_index=True
-            )
-        else:
-            st.success("✅ No hay clientes offline en este momento.")
-
-    with tab_olts:
-        if olts:
+    # Estado de OLTs
+    if olts:
+        with st.expander("🏢 Estado de Cabeceras (OLTs)"):
             for o in olts:
-                status = str(o.get('status')).upper()
-                color = "green" if status == "ONLINE" else "red"
-                st.markdown(f"**{o.get('name')}** | IP: `{o.get('ip')}` | Estado: :{color}[{status}]")
-        else:
-            st.info("No se pudo cargar el detalle de las OLTs.")
-
+                st.write(f"🖥️ **{o.get('name')}** - {o.get('status').upper()}")
 else:
-    st.error("❌ Error de conexión.")
-    st.info(f"Verifica que la URL en Secrets sea: {URL_BASE}")
-    st.write("Si el problema sigue, intenta generar un nuevo API Key en tu panel de SmartOLT.")
+    # --- MENSAJE DE DIAGNÓSTICO SI NADA FUNCIONA ---
+    st.error("❌ No se pudo conectar con la API.")
+    st.warning("⚠️ Posibles causas:")
+    st.write(f"1. **URL en Secrets:** Asegúrate de que sea exactamente `https://multinet.smartolt.com` (sin nada extra al final).")
+    st.write("2. **Token:** Verifica que no tenga espacios al principio o al final.")
+    st.write("3. **Permisos:** En tu panel de SmartOLT, asegúrate de que la API Key sea 'Read & Write' o 'Read-only'.")
 
-# --- REFRESCO AUTOMÁTICO ---
+# Refresco
 time.sleep(60)
 st.rerun()
