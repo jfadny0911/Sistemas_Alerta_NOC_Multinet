@@ -3,100 +3,119 @@ import pandas as pd
 import requests
 import time
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Multinet NOC - Alerta Total", page_icon="🚨", layout="wide")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Multinet NOC - Alertas Masivas", page_icon="📡", layout="wide")
 
-# 1. Credenciales (Ajustadas a tus nombres exactos)
+# 1. Credenciales
 try:
     URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
     SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
-    
-    # Aquí cambiamos 'bot_token' por 'token' para que coincida con tus secretos
     TG_TOKEN = st.secrets["telegram"]["token"]
     TG_CHAT = st.secrets["telegram"]["chat_id"]
 except Exception as e:
-    st.error(f"❌ Error en Secrets: Falta la llave {e}")
+    st.error(f"❌ Error en Secrets: {e}")
     st.stop()
 
-# --- MEMORIA DEL SISTEMA ---
-if 'fallas_activas' not in st.session_state:
-    st.session_state.fallas_activas = set()
+# --- MEMORIA DE ALERTAS (Para no repetir mensajes) ---
+if 'alertas_enviadas' not in st.session_state:
+    st.session_state.alertas_enviadas = {"puertos": set(), "zonas": set()}
 
-st.title("🛰️ Multinet NOC: Monitor con Alertas Telegram")
+st.title("🛰️ Multinet NOC: Monitor de Fallas por Zona y Puerto")
 
-# --- FUNCIÓN DE TELEGRAM ---
-def enviar_alerta_tg(mensaje):
+# --- FUNCIONES DE APOYO ---
+def enviar_tg(mensaje):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT, "text": mensaje, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except:
-        pass
+    try: requests.post(url, json=payload, timeout=10)
+    except: pass
 
-# --- MOTOR DE API ---
 def llamar_api(endpoint):
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': SMART_TOKEN}
     try:
         r = requests.post(url, headers=headers, timeout=20)
         if r.status_code == 405: r = requests.get(url, headers=headers, timeout=20)
-        if r.status_code == 200:
-            res = r.json()
-            return res.get('response') if res.get('status') else None
+        return r.json().get('response') if r.status_code == 200 else None
     except: return None
-    return None
 
-# --- MONITOREO ---
-with st.spinner('Escaneando red...'):
+# --- PROCESO PRINCIPAL ---
+with st.spinner('Analizando integridad de la red...'):
     onus = llamar_api("onu/get_onus_statuses")
+    zonas_info = llamar_api("system/get_zones")
 
 if onus is not None:
     df = pd.DataFrame(onus)
     
-    # ANALIZADOR DE ALERTAS
-    for _, row in df.iterrows():
-        sn = row['sn']
-        nombre = row.get('onu', 'Desconocido')
-        status = str(row['status']).lower()
-        pon = f"B{row['board']}/P{row['port']}"
-        
-        es_falla = status != 'online'
-        
-        # 1. Nueva Falla
-        if es_falla and sn not in st.session_state.fallas_activas:
-            tipo = "🔌 FALLA DE RED / ENERGÍA" if ("fail" in status or "los" in status) else "🔴 CLIENTE OFFLINE"
-            if "unreachable" in status: tipo = "📡 ONU INALCANZABLE"
-            
-            msg = f"{tipo}\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\n🔌 *Puerto:* {pon}\n⏱ *Status:* {status.upper()}"
-            enviar_alerta_tg(msg)
-            st.session_state.fallas_activas.add(sn)
-
-        # 2. Recuperación
-        elif not es_falla and sn in st.session_state.fallas_activas:
-            msg = f"✅ *RECUPERADO*\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\nStatus: ONLINE"
-            enviar_alerta_tg(msg)
-            st.session_state.fallas_activas.remove(sn)
-
-    # --- INTERFAZ ---
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total ONUs", len(df))
-    online = len(df[df['status'].str.lower() == 'online'])
-    c2.metric("Online ✅", online)
-    c3.metric("Fallas 🚨", len(st.session_state.fallas_activas), delta_color="inverse")
-
-    st.markdown("---")
-    st.subheader("📋 Estado Actual de Clientes")
+    # 1. TRADUCCIÓN DE ZONAS Y CLIENTES
+    df_z = pd.DataFrame(zonas_info) if zonas_info else pd.DataFrame(columns=['id', 'name'])
+    df['zone_id'] = df['zone_id'].astype(str)
+    df_z['id'] = df_z['id'].astype(str)
+    df = pd.merge(df, df_z[['id', 'name']], left_on='zone_id', right_on='id', how='left')
     
-    df['Status_Icon'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
+    # El campo NAME del cliente (Código)
+    df['CLIENTE_NAME'] = df['onu'].fillna(df['sn'])
+    df['PUERTO'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
+    df['ZONA_NOMBRE'] = df['name'].fillna("Zona " + df['zone_id'])
+
+    # --- LÓGICA DE DETECCIÓN MASIVA ---
+    df_offline = df[df['status'].str.lower() != 'online']
+    
+    # A. AGRUPAR POR PUERTO
+    fallas_puerto = df_offline.groupby(['olt_id', 'PUERTO']).size().reset_index(name='caidos')
+    # B. AGRUPAR POR ZONA
+    fallas_zona = df_offline.groupby(['ZONA_NOMBRE']).size().reset_index(name='caidos')
+
+    # --- ENVÍO DE ALERTAS INTELIGENTES ---
+    
+    # 🚨 Alerta por Puerto (Si hay más de 2 clientes caídos en el mismo puerto)
+    for _, f in fallas_puerto.iterrows():
+        id_p = f"{f['olt_id']}_{f['PUERTO']}"
+        if f['caidos'] >= 3: # Umbral: 3 o más clientes es falla de puerto
+            if id_p not in st.session_state.alertas_enviadas["puertos"]:
+                msg = f"💥 *FALLA DE PUERTO DETECTADA*\n\n🏗️ *OLT:* {f['olt_id']}\n🔌 *Puerto:* {f['PUERTO']}\n📉 *Impacto:* {f['caidos']} clientes Offline\n⚠️ *Posible:* Corte de fibra o falla en puerto PON."
+                enviar_tg(msg)
+                st.session_state.alertas_enviadas["puertos"].add(id_p)
+        elif f['caidos'] == 0 and id_p in st.session_state.alertas_enviadas["puertos"]:
+            enviar_tg(f"✅ *PUERTO RECUPERADO*\n\n🔌 Puerto: {f['PUERTO']} (OLT {f['olt_id']}) vuelve a estar estable.")
+            st.session_state.alertas_enviadas["puertos"].remove(id_p)
+
+    # 🚨 Alerta por Zona
+    for _, z in fallas_zona.iterrows():
+        nombre_z = z['ZONA_NOMBRE']
+        if z['caidos'] >= 5: # Umbral: 5 o más clientes es falla de zona/sector
+            if nombre_z not in st.session_state.alertas_enviadas["zonas"]:
+                msg = f"🚩 *FALLA GENERAL EN ZONA*\n\n📍 *Sector:* {nombre_z}\n👥 *Afectados:* {z['caidos']} clientes\n📡 *Estado:* Interrupción masiva detectada."
+                enviar_tg(msg)
+                st.session_state.alertas_enviadas["zonas"].add(nombre_z)
+        elif z['caidos'] == 0 and nombre_z in st.session_state.alertas_enviadas["zonas"]:
+            enviar_tg(f"✅ *ZONA RESTABLECIDA*\n\n📍 Sector: {nombre_z} ya no presenta fallas masivas.")
+            st.session_state.alertas_enviadas["zonas"].remove(nombre_z)
+
+    # --- INTERFAZ DEL DASHBOARD ---
+    st.subheader("📋 Monitor de Red (Vista Técnica)")
+    
+    # Columnas que querías: Name, SN, Status, etc.
+    df['Icono'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
+    
     st.dataframe(
-        df[['Status_Icon', 'onu', 'sn', 'board', 'port', 'status', 'last_status_change']].rename(
-            columns={'onu': 'Nombre/ID', 'board': 'B', 'port': 'P', 'status': 'Estado'}
+        df[['Icono', 'CLIENTE_NAME', 'sn', 'ZONA_NOMBRE', 'PUERTO', 'status', 'last_status_change']].rename(
+            columns={'CLIENTE_NAME': 'NAME (Código)', 'sn': 'Serie (SN)', 'status': 'Estado'}
         ),
         use_container_width=True, hide_index=True
     )
-else:
-    st.error("❌ Sin conexión con SmartOLT.")
 
-# Refresco
+    # Resumen de Fallas Actuales
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("🔴 **Puertos en Alerta:**")
+        st.write(list(st.session_state.alertas_enviadas["puertos"]))
+    with col2:
+        st.write("🚩 **Zonas con Falla General:**")
+        st.write(list(st.session_state.alertas_enviadas["zonas"]))
+
+else:
+    st.error("❌ No se pudo conectar con SmartOLT.")
+
+# Auto-refresco
 time.sleep(60)
 st.rerun()
