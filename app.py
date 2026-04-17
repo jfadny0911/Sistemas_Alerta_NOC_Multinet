@@ -12,8 +12,11 @@ NOMBRE_SHEET = "Inventario_NOC"
 
 # --- FUNCIONES DE APOYO ---
 def conectar_gsheets():
-    try: return gspread.service_account(filename='google_creds.json')
-    except: return None
+    try: 
+        return gspread.service_account(filename='google_creds.json')
+    except Exception as e: 
+        st.sidebar.error(f"Error Google Sheets: {e}")
+        return None
 
 def enviar_telegram(mensaje, device_id=None):
     try:
@@ -23,7 +26,8 @@ def enviar_telegram(mensaje, device_id=None):
         payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=10)
         return True
-    except: return False
+    except: 
+        return False
 
 # --- CABECERA ---
 st.title("🛰️ Dashboard de Clientes y Red - SmartOLT")
@@ -36,22 +40,31 @@ onus_data = []
 stats = {"online": 0, "offline": 0, "total": 0}
 
 try:
-    url_base = st.secrets['smartolt']['url']
+    # Quitamos la barra diagonal final de la URL si el usuario la puso por accidente
+    url_base = str(st.secrets['smartolt']['url']).rstrip('/')
     headers = {'X-Token': st.secrets['smartolt']['token']}
     
-    # 1. Traer todas las ONUs (Clientes)
-    r_onus = requests.get(f"{url_base}/api/onu/get_all", headers=headers, timeout=20)
+    # 1. Traer todas las ONUs (Clientes) con un timeout más alto
+    r_onus = requests.get(f"{url_base}/api/onu/get_all", headers=headers, timeout=40)
     
     if r_onus.status_code == 200:
-        onus_data = r_onus.json().get('response', [])
+        # Algunos endpoints de SmartOLT devuelven la lista directo, otros dentro de 'response'
+        data_json = r_onus.json()
+        onus_data = data_json.get('response', []) if isinstance(data_json, dict) else data_json
+        
         stats["total"] = len(onus_data)
-        stats["online"] = len([o for o in onus_data if o.get('status') == 'online'])
-        stats["offline"] = len([o for o in onus_data if o.get('status') != 'online'])
+        stats["online"] = len([o for o in onus_data if str(o.get('status')).lower() == 'online'])
+        stats["offline"] = stats["total"] - stats["online"]
     else:
-        st.error("Error al conectar con la API de ONUs de SmartOLT")
+        # AQUÍ ESTÁ EL DIAGNÓSTICO EXACTO
+        st.error(f"❌ Error SmartOLT ONUs (Código {r_onus.status_code}): {r_onus.text}")
 
+except KeyError as e:
+    st.error(f"❌ Falla en secretos: Falta la llave {e} en secrets.toml")
+except requests.exceptions.Timeout:
+    st.error("⏳ SmartOLT tardó demasiado en responder. Tu red tiene muchos clientes o la API está lenta.")
 except Exception as e:
-    st.error(f"Error de conexión: {e}")
+    st.error(f"❌ Error de conexión: {e}")
 
 # --- SECCIÓN 1: MÉTRICAS GENERALES ---
 col1, col2, col3, col4 = st.columns(4)
@@ -65,44 +78,85 @@ with col4:
     eficiencia = (stats["online"] / stats["total"] * 100) if stats["total"] > 0 else 0
     st.metric("Salud de la Red", f"{eficiencia:.1f}%")
 
+st.markdown("---")
+
 # --- SECCIÓN 2: PESTAÑAS ---
-tab1, tab2, tab3 = st.tabs(["🔴 Clientes en Falla", "🏢 Estado de OLTs", "📈 Historial"])
+tab1, tab2, tab3 = st.tabs(["🔴 Clientes en Falla", "🏢 Estado de OLTs", "📈 Historial del NOC"])
 
 with tab1:
     st.subheader("Clientes fuera de línea (Offline)")
-    clientes_off = [o for o in onus_data if o.get('status') != 'online']
+    clientes_off = [o for o in onus_data if str(o.get('status')).lower() != 'online']
     
     if clientes_off:
         df_off = pd.DataFrame(clientes_off)
-        # Seleccionamos solo las columnas importantes para no saturar
-        columnas_ver = ['name', 'sn', 'olt_name', 'pon_port', 'signal', 'last_online_at']
-        # Renombramos para que sea más legible
-        df_display = df_off[columnas_ver].rename(columns={
-            'name': 'Cliente',
-            'sn': 'Serie ONU',
-            'olt_name': 'OLT',
-            'pon_port': 'Puerto PON',
-            'signal': 'Última Señal',
-            'last_online_at': 'Visto por última vez'
-        })
         
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        # Filtramos las columnas si existen en la respuesta de SmartOLT
+        columnas_disponibles = df_off.columns.tolist()
+        columnas_ver = []
+        nombres_amigables = {}
+        
+        if 'name' in columnas_disponibles: 
+            columnas_ver.append('name')
+            nombres_amigables['name'] = 'Cliente'
+        if 'sn' in columnas_disponibles:
+            columnas_ver.append('sn')
+            nombres_amigables['sn'] = 'Serie ONU'
+        if 'olt_name' in columnas_disponibles:
+            columnas_ver.append('olt_name')
+            nombres_amigables['olt_name'] = 'OLT'
+        if 'pon_port' in columnas_disponibles:
+            columnas_ver.append('pon_port')
+            nombres_amigables['pon_port'] = 'Puerto PON'
+        if 'signal' in columnas_disponibles:
+            columnas_ver.append('signal')
+            nombres_amigables['signal'] = 'Última Señal'
+        if 'last_online_at' in columnas_disponibles:
+            columnas_ver.append('last_online_at')
+            nombres_amigables['last_online_at'] = 'Visto última vez'
+            
+        if columnas_ver:
+            df_display = df_off[columnas_ver].rename(columns=nombres_amigables)
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(df_off, use_container_width=True) # Por si la API devuelve algo distinto
     else:
-        st.success("🎉 ¡Increíble! No hay clientes offline en este momento.")
+        if stats["total"] > 0:
+            st.success("🎉 ¡Increíble! No hay clientes offline en este momento.")
+        else:
+            st.info("Esperando datos de la API...")
 
 with tab2:
     st.subheader("Estado de Cabeceras (OLTs)")
-    # Aquí puedes mantener el código anterior de /api/system/get_olts
-    # para vigilar si una OLT completa se cae.
     try:
         r_olts = requests.get(f"{url_base}/api/system/get_olts", headers=headers, timeout=15)
         if r_olts.status_code == 200:
-            olts = r_olts.json().get('response', [])
+            data_olts = r_olts.json()
+            olts = data_olts.get('response', []) if isinstance(data_olts, dict) else data_olts
+            
             for o in olts:
-                color = "green" if o.get('status') == 'online' else "red"
-                st.markdown(f"**{o.get('name')}**: :{color}[{o.get('status').upper()}] - IP: {o.get('ip')}")
-    except:
+                estado_str = str(o.get('status', 'offline')).lower()
+                color = "green" if estado_str in ['online', '1', 'up'] else "red"
+                st.markdown(f"**{o.get('name', 'OLT')}**: :{color}[{estado_str.upper()}] - IP: {o.get('ip', 'N/A')}")
+        else:
+            st.error(f"Error cargando OLTs: {r_olts.status_code}")
+    except Exception as e:
         st.write("No se pudo cargar el estado de las OLTs.")
+
+with tab3:
+    st.subheader("Historial de Atención de Fallas (Google Sheets)")
+    gc = conectar_gsheets()
+    if gc:
+        try:
+            sh = gc.open(NOMBRE_SHEET)
+            df_logs = pd.DataFrame(sh.worksheet("Log_Fallas").get_all_records())
+            if not df_logs.empty:
+                st.dataframe(df_logs.tail(15), use_container_width=True)
+            else:
+                st.info("No hay registros en el archivo Log_Fallas.")
+        except Exception as e:
+            st.warning("No se pudo leer la pestaña Log_Fallas del Excel.")
+    else:
+        st.error("Conexión a Google Sheets no disponible.")
 
 # --- AUTO REFRESH ---
 time.sleep(60)
