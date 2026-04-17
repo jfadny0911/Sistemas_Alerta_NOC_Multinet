@@ -1,87 +1,90 @@
 import streamlit as st
-import pd as pd # No es necesario el alias pd si usas pandas directo, pero lo mantengo por tu estilo
 import pandas as pd
 import requests
 import gspread
 import time
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="NOC Multinet - SmartOLT", page_icon="📡", layout="wide")
-NOMBRE_SHEET = "Inventario_NOC"
 
-def conectar_gsheets():
-    try: return gspread.service_account(filename='google_creds.json')
-    except: return None
-
-# --- LIMPIEZA DE URL ---
-# Esto asegura que la URL sea: https://dominio.com/api/onu/get_all
-url_limpia = str(st.secrets['smartolt']['url']).rstrip('/')
-if not url_limpia.endswith('/api'):
-    url_final = f"{url_limpia}/api"
-else:
-    url_final = url_limpia
-
-headers = {'X-Token': st.secrets['smartolt']['token']}
+# 1. Limpieza profunda de la URL de tus secretos
+# Esto quita espacios, barras finales y asegura el formato correcto
+URL_BASE = str(st.secrets['smartolt']['url']).strip().rstrip('/')
+TOKEN = str(st.secrets['smartolt']['token']).strip()
+HEADERS = {'X-Token': TOKEN}
 
 st.title("🛰️ Sistema NOC Multinet - SmartOLT")
 
-# --- LÓGICA DE DATOS ---
-onus_data = []
-stats = {"online": 0, "offline": 0, "total": 0}
-
-try:
-    # Intentamos obtener los clientes
-    # Nota: Si POST falla con 405, a veces es porque esta versión específica de SmartOLT usa GET
-    r = requests.post(f"{url_final}/onu/get_all", headers=headers, timeout=30)
+# --- FUNCIÓN DE PRUEBA DE CONEXIÓN ---
+def obtener_datos(endpoint):
+    # Intentamos con /api/ y sin /api/ por si acaso
+    rutas_a_probar = [
+        f"{URL_BASE}/api/{endpoint}",
+        f"{URL_BASE}/{endpoint}"
+    ]
     
-    # Si da error 405 con POST, intentamos automáticamente con GET
-    if r.status_code == 405:
-        r = requests.get(f"{url_final}/onu/get_all", headers=headers, timeout=30)
-
-    if r.status_code == 200:
-        res = r.json()
-        if res.get('status'):
-            onus_data = res.get('response', [])
-            stats["total"] = len(onus_data)
-            stats["online"] = len([o for o in onus_data if str(o.get('status')).lower() == 'online'])
-            stats["offline"] = stats["total"] - stats["online"]
-        else:
-            st.error(f"❌ Error de SmartOLT: {res.get('error')}")
-    else:
-        st.error(f"❌ Error de Conexión (Código {r.status_code})")
-        st.info(f"URL intentada: {url_final}/onu/get_all")
-
-except Exception as e:
-    st.error(f"❌ Error crítico: {e}")
-
-# --- INTERFAZ ---
-col1, col2, col3 = st.columns(3)
-col1.metric("Clientes Totales", stats["total"])
-col2.metric("Online ✅", stats["online"])
-col3.metric("Offline ❌", stats["offline"], delta_color="inverse")
-
-tab1, tab2 = st.tabs(["🔴 Fallas Actuales", "📊 Historial"])
-
-with tab1:
-    clientes_off = [o for o in onus_data if str(o.get('status')).lower() != 'online']
-    if clientes_off:
-        df = pd.DataFrame(clientes_off)
-        # Seleccionamos solo lo que SmartOLT garantiza enviar
-        cols = [c for c in ['name', 'sn', 'olt_name', 'pon_port', 'signal'] if c in df.columns]
-        st.dataframe(df[cols], use_container_width=True)
-    else:
-        st.success("Sin clientes offline detectados.")
-
-with tab2:
-    st.write("Datos de Google Sheets")
-    gc = conectar_gsheets()
-    if gc:
+    ultimo_error = ""
+    for url in rutas_a_probar:
         try:
-            sh = gc.open(NOMBRE_SHEET)
-            st.dataframe(pd.DataFrame(sh.worksheet("Log_Fallas").get_all_records()).tail(10))
-        except: st.warning("No se pudo cargar el historial.")
+            # SmartOLT prefiere POST para casi todo
+            r = requests.post(url, headers=HEADERS, timeout=15)
+            
+            # Si da 405 (el error que tienes), intentamos con GET en esa misma URL
+            if r.status_code == 405:
+                r = requests.get(url, headers=HEADERS, timeout=15)
+            
+            if r.status_code == 200:
+                res = r.json()
+                if res.get('status'):
+                    return res.get('response', [])
+                else:
+                    ultimo_error = res.get('error')
+            else:
+                ultimo_error = f"Error {r.status_code}: {r.text}"
+        except Exception as e:
+            ultimo_error = str(e)
+            
+    st.error(f"❌ No se pudo conectar a {endpoint}. Detalle: {ultimo_error}")
+    # Mostramos la URL que falló para que sepas qué está pasando
+    st.info(f"Probando conexión en: {URL_BASE}")
+    return None
 
+# --- LÓGICA DE PANTALLA ---
+onus = obtener_datos("onu/get_all")
+
+if onus:
+    # Estadísticas
+    total = len(onus)
+    online = len([o for o in onus if str(o.get('status')).lower() == 'online'])
+    offline = total - online
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Clientes", total)
+    col2.metric("Online ✅", online)
+    col3.metric("Offline ❌", offline, delta_color="inverse")
+
+    st.markdown("---")
+    
+    # Tabla de Fallas
+    st.subheader("🔴 Clientes fuera de línea")
+    df_off = pd.DataFrame([o for o in onus if str(o.get('status')).lower() != 'online'])
+    
+    if not df_off.empty:
+        # Solo mostrar columnas que existan
+        cols_interes = ['name', 'sn', 'olt_name', 'pon_port', 'signal']
+        existentes = [c for c in cols_interes if c in df_off.columns]
+        st.dataframe(df_off[existentes], use_container_width=True)
+    else:
+        st.success("¡Todo en orden! No hay clientes caídos.")
+
+# --- ESTADO DE OLTS ---
+with st.expander("🏢 Ver Estado de OLTs"):
+    olts = obtener_datos("system/get_olts")
+    if olts:
+        for o in olts:
+            st.write(f"🖥️ **{o.get('name')}** - IP: {o.get('ip')} - Status: {o.get('status')}")
+
+# Auto-refresco cada 60 segundos
 time.sleep(60)
 st.rerun()
