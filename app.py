@@ -2,35 +2,35 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-from datetime import datetime
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Multinet Ultra-NOC", page_icon="🌐", layout="wide")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Multinet NOC - Alerta Total", page_icon="🚨", layout="wide")
 
-# 1. Credenciales
-try:
-    URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
-    TOKEN = st.secrets["smartolt"]["token"].strip()
-except:
-    st.error("❌ Configura los Secrets [smartolt] correctamente.")
-    st.stop()
+# Credenciales
+URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
+SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
+TG_TOKEN = st.secrets["telegram"]["bot_token"]
+TG_CHAT = st.secrets["telegram"]["chat_id"]
 
-# 2. Coordenadas de Zonas (Copia los nombres de tu captura)
-# Reemplaza con las coordenadas reales de tus nodos
-MAPA_ZONAS = {
-    "San Pedro Masahuat": [13.5436, -89.0403],
-    "Conchalio": [13.4912, -89.3789],
-    "San Blas": [13.4850, -89.3500],
-    "El Encanto": [13.4820, -89.3400],
-    "Default": [13.6800, -89.1800]
-}
+# --- MEMORIA DEL SISTEMA (Evita spam de mensajes) ---
+if 'fallas_activas' not in st.session_state:
+    st.session_state.fallas_activas = set() # Aquí guardamos los SN que ya notificamos
 
-st.title("🚀 Multinet NOC: Gestión Integral SmartOLT")
+st.title("🛰️ Multinet NOC: Monitor con Alertas Telegram")
+
+# --- FUNCIÓN DE TELEGRAM ---
+def enviar_alerta_tg(mensaje):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT, "text": mensaje, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except:
+        pass
 
 # --- MOTOR DE API ---
 def llamar_api(endpoint):
     url = f"{URL_BASE}/api/{endpoint}"
-    headers = {'X-Token': TOKEN}
+    headers = {'X-Token': SMART_TOKEN}
     try:
         r = requests.post(url, headers=headers, timeout=20)
         if r.status_code == 405: r = requests.get(url, headers=headers, timeout=20)
@@ -40,116 +40,70 @@ def llamar_api(endpoint):
     except: return None
     return None
 
-# --- CARGA MASIVA ---
-with st.spinner('Extrayendo inteligencia de red...'):
+# --- PROCESO DE MONITOREO ---
+with st.spinner('Escaneando red en busca de fallas...'):
     onus = llamar_api("onu/get_onus_statuses")
-    olts = llamar_api("system/get_olts")
     zonas = llamar_api("system/get_zones")
-    unconfigured = llamar_api("onu/get_unconfigured")
 
 if onus is not None:
     df = pd.DataFrame(onus)
     
-    # TRADUCCIÓN DE ZONAS
-    if zonas:
-        df_z = pd.DataFrame(zonas)
-        df_z['id'] = df_z['id'].astype(str)
-        df['zone_id'] = df['zone_id'].astype(str)
-        df = pd.merge(df, df_z[['id', 'name']], left_on='zone_id', right_on='id', how='left')
-        df['Zona'] = df['name'].fillna("Sin Zona")
-    else:
-        df['Zona'] = df['zone_id']
-
-    # LIMPIEZA Y FORMATO
-    df['Estado'] = df['status'].apply(lambda x: "🟢 ONLINE" if str(x).lower() == 'online' else "🔴 OFFLINE")
-    df['pon'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
+    # Cruce de Zonas para el mensaje de Telegram
+    df_z = pd.DataFrame(zonas) if zonas else pd.DataFrame()
     
-    # --- FILA 1: KPI'S GLOBALES ---
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Base Instalada", len(df))
-    online_total = len(df[df['status'].str.lower() == 'online'])
-    k2.metric("Clientes Online", online_total)
-    k3.metric("Clientes Offline", len(df) - online_total, delta_color="inverse")
-    k4.metric("Nuevas por Autorizar", len(unconfigured) if unconfigured else 0)
+    # ANALIZADOR DE ALERTAS
+    for _, row in df.iterrows():
+        sn = row['sn']
+        nombre = row.get('onu', 'Desconocido')
+        status = str(row['status']).lower()
+        pon = f"B{row['board']}/P{row['port']}"
+        
+        # Lógica de detección de falla (LoS, PwFail, Offline, etc.)
+        es_falla = status != 'online'
+        
+        # 1. Detectar Nueva Falla
+        if es_falla and sn not in st.session_state.fallas_activas:
+            # Determinamos el tipo de falla (Si SmartOLT no da el detalle, lo marcamos como Crítico)
+            tipo_falla = "🔴 ALERTA DE CAÍDA"
+            if "fail" in status or "los" in status:
+                tipo_falla = "🔌 FALLA DE ENERGÍA / CORTE FIBRA"
+            elif "unreachable" in status:
+                tipo_falla = "📡 ONU INALCANZABLE (N/A)"
+            
+            msg = f"{tipo_falla}\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\n🔌 *Puerto:* {pon}\n⏱ *Status:* {status.upper()}"
+            enviar_alerta_tg(msg)
+            st.session_state.fallas_activas.add(sn)
+            st.toast(f"Alerta enviada: {nombre}", icon="🚨")
+
+        # 2. Detectar Recuperación (Back Online)
+        elif not es_falla and sn in st.session_state.fallas_activas:
+            msg = f"✅ *CLIENTE RECUPERADO*\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\nStatus: ONLINE"
+            enviar_alerta_tg(msg)
+            st.session_state.fallas_activas.remove(sn)
+            st.toast(f"Cliente recuperado: {nombre}", icon="✅")
+
+    # --- INTERFAZ DEL DASHBOARD ---
+    c1, c2, c3 = st.columns(3)
+    c1.metric("ONUs Totales", len(df))
+    online = len(df[df['status'].str.lower() == 'online'])
+    c2.metric("Online ✅", online)
+    c3.metric("Fallas Activas 🚨", len(st.session_state.fallas_activas), delta_color="inverse")
 
     st.markdown("---")
-
-    # --- FILA 2: PESTAÑAS OPERATIVAS ---
-    tab_list, tab_map, tab_sat, tab_hw, tab_new = st.tabs([
-        "👥 Lista de Clientes", 
-        "📍 Mapa de Red", 
-        "🏗️ Saturación PON", 
-        "🏢 Estado OLTs",
-        "🆕 Nuevas ONUs"
-    ])
-
-    with tab_list:
-        st.subheader("🔍 Buscador Maestro de Clientes")
-        busqueda = st.text_input("Buscar por SN o ID", placeholder="Ej: HWTC... o 20260397")
-        
-        df_view = df.copy()
-        if busqueda:
-            df_view = df_view[
-                (df_view['sn'].str.contains(busqueda, case=False)) | 
-                (df_view['onu'].str.contains(busqueda, case=False))
-            ]
-        
-        # Tabla detallada como la de SmartOLT
-        st.dataframe(
-            df_view[['onu', 'sn', 'Estado', 'Zona', 'pon', 'last_status_change']].rename(
-                columns={'onu': 'Nombre/ID', 'sn': 'Número de Serie', 'pon': 'Puerto PON', 'last_status_change': 'Último Cambio'}
-            ),
-            use_container_width=True, hide_index=True
-        )
-
-    with tab_map:
-        st.subheader("📍 Distribución Geográfica por Zonas")
-        # Agrupar para el mapa
-        df_map = df.groupby('Zona').size().reset_index(name='total')
-        map_points = []
-        for _, r in df_map.iterrows():
-            coords = MAPA_ZONAS.get(r['Zona'], MAPA_ZONAS["Default"])
-            map_points.append({'lat': coords[0], 'lon': coords[1], 'size': r['total'] * 10})
-        
-        st.map(pd.DataFrame(map_points), latitude='lat', longitude='lon', size='size')
-
-    with tab_sat:
-        st.subheader("📊 Carga de Puertos (Capacidad)")
-        sat = df.groupby(['olt_id', 'pon']).size().reset_index(name='total')
-        sat['Carga %'] = (sat['total'] / 64 * 100).round(1)
-        
-        col_bar, col_tab = st.columns([2, 1])
-        with col_bar:
-            st.bar_chart(sat.set_index('pon')['total'])
-        with col_tab:
-            st.write("Puertos con más carga:")
-            st.dataframe(sat.sort_values(by='total', ascending=False).head(10), hide_index=True)
-
-    with tab_hw:
-        st.subheader("🖥️ Salud del Hardware")
-        if olts:
-            for o in olts:
-                n_olt = o.get('name') or 'OLT'
-                st_raw = str(o.get('status') or 'offline').upper()
-                color = "green" if st_raw == "ONLINE" else "red"
-                with st.expander(f"OLT: {n_olt} - {o.get('ip')}"):
-                    st.markdown(f"**Estado:** :{color}[{st_raw}]")
-                    st.write(f"**Modelo:** {o.get('hardware_version', 'N/A')}")
-        else:
-            st.info("No se pudo obtener información detallada de las OLTs.")
-
-    with tab_new:
-        st.subheader("🆕 ONUs Detectadas (Pendientes de Autorizar)")
-        if unconfigured:
-            df_un = pd.DataFrame(unconfigured)
-            st.success(f"Se han detectado {len(df_un)} equipos nuevos.")
-            st.dataframe(df_un[['sn', 'olt_id', 'board', 'port', 'model']], use_container_width=True)
-        else:
-            st.write("No hay equipos nuevos esperando en la red.")
+    st.subheader("📋 Monitor de Estado en Tiempo Real")
+    
+    # Mostramos la tabla filtrando las columnas que te interesan
+    df['Status_Icon'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
+    st.dataframe(
+        df[['Status_Icon', 'onu', 'sn', 'board', 'port', 'status', 'last_status_change']].rename(
+            columns={'onu': 'Nombre/ID', 'board': 'B', 'port': 'P', 'status': 'Estado'}
+        ),
+        use_container_width=True, hide_index=True
+    )
 
 else:
-    st.error("❌ No se pudo conectar a la API. Revisa tus credenciales.")
+    st.error("Error de conexión. Revisa el Token.")
 
-# Refresco
+# Auto-refresco cada 60 segundos
 time.sleep(60)
 st.rerun()
