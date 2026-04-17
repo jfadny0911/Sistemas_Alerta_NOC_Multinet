@@ -5,7 +5,7 @@ import os
 
 # --- CONFIGURACIÓN ---
 # Reemplaza "TU_TOKEN_DE_TELEGRAM_AQUI" por el token de tu bot de @BotFather
-TOKEN = "8291607048:AAEbfL-sqqfWTrl0hQoBUtKPUovMDoTmLWQ" 
+TOKEN = "1234567890:ABCdefGhIJKlmNoPQRsTUVwxyZ" 
 NOMBRE_SHEET = "Inventario_NOC"
 
 bot = telebot.TeleBot(TOKEN)
