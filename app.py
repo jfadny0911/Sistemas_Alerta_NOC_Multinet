@@ -2,17 +2,32 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-from urllib.parse import urlparse
+from datetime import datetime
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Multinet NOC - Clientes", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Multinet Ultra-NOC", page_icon="🌐", layout="wide")
 
-# Credenciales
-URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
-TOKEN = st.secrets["smartolt"]["token"].strip()
+# 1. Credenciales
+try:
+    URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
+    TOKEN = st.secrets["smartolt"]["token"].strip()
+except:
+    st.error("❌ Configura los Secrets [smartolt] correctamente.")
+    st.stop()
 
-st.title("🛰️ Multinet NOC: Gestión de Clientes y Estados")
+# 2. Coordenadas de Zonas (Copia los nombres de tu captura)
+# Reemplaza con las coordenadas reales de tus nodos
+MAPA_ZONAS = {
+    "San Pedro Masahuat": [13.5436, -89.0403],
+    "Conchalio": [13.4912, -89.3789],
+    "San Blas": [13.4850, -89.3500],
+    "El Encanto": [13.4820, -89.3400],
+    "Default": [13.6800, -89.1800]
+}
 
+st.title("🚀 Multinet NOC: Gestión Integral SmartOLT")
+
+# --- MOTOR DE API ---
 def llamar_api(endpoint):
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': TOKEN}
@@ -25,16 +40,17 @@ def llamar_api(endpoint):
     except: return None
     return None
 
-# --- CARGA DE DATOS ---
-with st.spinner('Sincronizando base de datos de clientes...'):
-    # Usamos get_onus_statuses para velocidad y get_zones para nombres
+# --- CARGA MASIVA ---
+with st.spinner('Extrayendo inteligencia de red...'):
     onus = llamar_api("onu/get_onus_statuses")
+    olts = llamar_api("system/get_olts")
     zonas = llamar_api("system/get_zones")
+    unconfigured = llamar_api("onu/get_unconfigured")
 
 if onus is not None:
     df = pd.DataFrame(onus)
     
-    # 1. TRADUCCIÓN DE ZONAS (Para que diga "San Pedro Masahuat")
+    # TRADUCCIÓN DE ZONAS
     if zonas:
         df_z = pd.DataFrame(zonas)
         df_z['id'] = df_z['id'].astype(str)
@@ -44,59 +60,96 @@ if onus is not None:
     else:
         df['Zona'] = df['zone_id']
 
-    # 2. LIMPIEZA DE DATOS
-    # El campo 'onu' suele traer el ID o Nombre que buscas
-    df['Cliente_ID'] = df['onu'].fillna(df['sn']) 
+    # LIMPIEZA Y FORMATO
     df['Estado'] = df['status'].apply(lambda x: "🟢 ONLINE" if str(x).lower() == 'online' else "🔴 OFFLINE")
-
-    # --- BUSCADOR Y FILTROS ---
-    st.markdown("### 🔍 Buscador de Clientes")
-    col_bus, col_zon = st.columns([2, 1])
+    df['pon'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
     
-    with col_bus:
-        busqueda = st.text_input("Buscar por SN o Nombre de Cliente", placeholder="Ej: HWTC78F5... o 20260397")
-    
-    with col_zon:
-        lista_zonas = ["Todas"] + sorted(df['Zona'].unique().tolist())
-        zona_sel = st.selectbox("Filtrar por Zona", lista_zonas)
+    # --- FILA 1: KPI'S GLOBALES ---
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Base Instalada", len(df))
+    online_total = len(df[df['status'].str.lower() == 'online'])
+    k2.metric("Clientes Online", online_total)
+    k3.metric("Clientes Offline", len(df) - online_total, delta_color="inverse")
+    k4.metric("Nuevas por Autorizar", len(unconfigured) if unconfigured else 0)
 
-    # Aplicar Filtros
-    df_filtrado = df.copy()
-    if busqueda:
-        df_filtrado = df_filtrado[
-            (df_filtrado['sn'].str.contains(busqueda, case=False)) | 
-            (df_filtrado['Cliente_ID'].str.contains(busqueda, case=False))
-        ]
-    if zona_sel != "Todas":
-        df_filtrado = df_filtrado[df_filtrado['Zona'] == zona_sel]
-
-    # --- TABLA MAESTRA ---
     st.markdown("---")
-    st.subheader(f"📋 Listado de Clientes ({len(df_filtrado)})")
-    
-    # Preparamos la tabla final
-    tabla_display = df_filtrado[['Cliente_ID', 'sn', 'Estado', 'Zona', 'last_status_change']].copy()
-    tabla_display.columns = ['Nombre / ONU', 'Número de Serie (SN)', 'Estado Actual', 'Zona / Sector', 'Último Cambio']
-    
-    st.dataframe(
-        tabla_display, 
-        use_container_width=True, 
-        hide_index=True,
-        column_config={
-            "Estado Actual": st.column_config.TextColumn("Estado Actual", help="🟢 Activo | 🔴 Inactivo")
-        }
-    )
 
-    # --- RESUMEN RÁPIDO ---
-    st.markdown("---")
-    res1, res2, res3 = st.columns(3)
-    res1.metric("Total en Red", len(df))
-    res2.metric("Activos (Online)", len(df[df['status'].str.lower() == 'online']))
-    res3.metric("Caídos (Offline)", len(df[df['status'].str.lower() != 'online']), delta_color="inverse")
+    # --- FILA 2: PESTAÑAS OPERATIVAS ---
+    tab_list, tab_map, tab_sat, tab_hw, tab_new = st.tabs([
+        "👥 Lista de Clientes", 
+        "📍 Mapa de Red", 
+        "🏗️ Saturación PON", 
+        "🏢 Estado OLTs",
+        "🆕 Nuevas ONUs"
+    ])
+
+    with tab_list:
+        st.subheader("🔍 Buscador Maestro de Clientes")
+        busqueda = st.text_input("Buscar por SN o ID", placeholder="Ej: HWTC... o 20260397")
+        
+        df_view = df.copy()
+        if busqueda:
+            df_view = df_view[
+                (df_view['sn'].str.contains(busqueda, case=False)) | 
+                (df_view['onu'].str.contains(busqueda, case=False))
+            ]
+        
+        # Tabla detallada como la de SmartOLT
+        st.dataframe(
+            df_view[['onu', 'sn', 'Estado', 'Zona', 'pon', 'last_status_change']].rename(
+                columns={'onu': 'Nombre/ID', 'sn': 'Número de Serie', 'pon': 'Puerto PON', 'last_status_change': 'Último Cambio'}
+            ),
+            use_container_width=True, hide_index=True
+        )
+
+    with tab_map:
+        st.subheader("📍 Distribución Geográfica por Zonas")
+        # Agrupar para el mapa
+        df_map = df.groupby('Zona').size().reset_index(name='total')
+        map_points = []
+        for _, r in df_map.iterrows():
+            coords = MAPA_ZONAS.get(r['Zona'], MAPA_ZONAS["Default"])
+            map_points.append({'lat': coords[0], 'lon': coords[1], 'size': r['total'] * 10})
+        
+        st.map(pd.DataFrame(map_points), latitude='lat', longitude='lon', size='size')
+
+    with tab_sat:
+        st.subheader("📊 Carga de Puertos (Capacidad)")
+        sat = df.groupby(['olt_id', 'pon']).size().reset_index(name='total')
+        sat['Carga %'] = (sat['total'] / 64 * 100).round(1)
+        
+        col_bar, col_tab = st.columns([2, 1])
+        with col_bar:
+            st.bar_chart(sat.set_index('pon')['total'])
+        with col_tab:
+            st.write("Puertos con más carga:")
+            st.dataframe(sat.sort_values(by='total', ascending=False).head(10), hide_index=True)
+
+    with tab_hw:
+        st.subheader("🖥️ Salud del Hardware")
+        if olts:
+            for o in olts:
+                n_olt = o.get('name') or 'OLT'
+                st_raw = str(o.get('status') or 'offline').upper()
+                color = "green" if st_raw == "ONLINE" else "red"
+                with st.expander(f"OLT: {n_olt} - {o.get('ip')}"):
+                    st.markdown(f"**Estado:** :{color}[{st_raw}]")
+                    st.write(f"**Modelo:** {o.get('hardware_version', 'N/A')}")
+        else:
+            st.info("No se pudo obtener información detallada de las OLTs.")
+
+    with tab_new:
+        st.subheader("🆕 ONUs Detectadas (Pendientes de Autorizar)")
+        if unconfigured:
+            df_un = pd.DataFrame(unconfigured)
+            st.success(f"Se han detectado {len(df_un)} equipos nuevos.")
+            st.dataframe(df_un[['sn', 'olt_id', 'board', 'port', 'model']], use_container_width=True)
+        else:
+            st.write("No hay equipos nuevos esperando en la red.")
 
 else:
-    st.error("❌ No se pudo conectar con SmartOLT. Revisa el Token.")
+    st.error("❌ No se pudo conectar a la API. Revisa tus credenciales.")
 
-# Auto-refresco
+# Refresco
 time.sleep(60)
 st.rerun()
