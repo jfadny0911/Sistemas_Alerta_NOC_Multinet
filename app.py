@@ -3,18 +3,24 @@ import pandas as pd
 import requests
 import time
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="Multinet NOC - Alerta Total", page_icon="🚨", layout="wide")
 
-# Credenciales
-URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
-SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
-TG_TOKEN = st.secrets["telegram"]["bot_token"]
-TG_CHAT = st.secrets["telegram"]["chat_id"]
+# 1. Credenciales (Ajustadas a tus nombres exactos)
+try:
+    URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
+    SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
+    
+    # Aquí cambiamos 'bot_token' por 'token' para que coincida con tus secretos
+    TG_TOKEN = st.secrets["telegram"]["token"]
+    TG_CHAT = st.secrets["telegram"]["chat_id"]
+except Exception as e:
+    st.error(f"❌ Error en Secrets: Falta la llave {e}")
+    st.stop()
 
-# --- MEMORIA DEL SISTEMA (Evita spam de mensajes) ---
+# --- MEMORIA DEL SISTEMA ---
 if 'fallas_activas' not in st.session_state:
-    st.session_state.fallas_activas = set() # Aquí guardamos los SN que ya notificamos
+    st.session_state.fallas_activas = set()
 
 st.title("🛰️ Multinet NOC: Monitor con Alertas Telegram")
 
@@ -40,16 +46,12 @@ def llamar_api(endpoint):
     except: return None
     return None
 
-# --- PROCESO DE MONITOREO ---
-with st.spinner('Escaneando red en busca de fallas...'):
+# --- MONITOREO ---
+with st.spinner('Escaneando red...'):
     onus = llamar_api("onu/get_onus_statuses")
-    zonas = llamar_api("system/get_zones")
 
 if onus is not None:
     df = pd.DataFrame(onus)
-    
-    # Cruce de Zonas para el mensaje de Telegram
-    df_z = pd.DataFrame(zonas) if zonas else pd.DataFrame()
     
     # ANALIZADOR DE ALERTAS
     for _, row in df.iterrows():
@@ -58,41 +60,33 @@ if onus is not None:
         status = str(row['status']).lower()
         pon = f"B{row['board']}/P{row['port']}"
         
-        # Lógica de detección de falla (LoS, PwFail, Offline, etc.)
         es_falla = status != 'online'
         
-        # 1. Detectar Nueva Falla
+        # 1. Nueva Falla
         if es_falla and sn not in st.session_state.fallas_activas:
-            # Determinamos el tipo de falla (Si SmartOLT no da el detalle, lo marcamos como Crítico)
-            tipo_falla = "🔴 ALERTA DE CAÍDA"
-            if "fail" in status or "los" in status:
-                tipo_falla = "🔌 FALLA DE ENERGÍA / CORTE FIBRA"
-            elif "unreachable" in status:
-                tipo_falla = "📡 ONU INALCANZABLE (N/A)"
+            tipo = "🔌 FALLA DE RED / ENERGÍA" if ("fail" in status or "los" in status) else "🔴 CLIENTE OFFLINE"
+            if "unreachable" in status: tipo = "📡 ONU INALCANZABLE"
             
-            msg = f"{tipo_falla}\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\n🔌 *Puerto:* {pon}\n⏱ *Status:* {status.upper()}"
+            msg = f"{tipo}\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\n🔌 *Puerto:* {pon}\n⏱ *Status:* {status.upper()}"
             enviar_alerta_tg(msg)
             st.session_state.fallas_activas.add(sn)
-            st.toast(f"Alerta enviada: {nombre}", icon="🚨")
 
-        # 2. Detectar Recuperación (Back Online)
+        # 2. Recuperación
         elif not es_falla and sn in st.session_state.fallas_activas:
-            msg = f"✅ *CLIENTE RECUPERADO*\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\nStatus: ONLINE"
+            msg = f"✅ *RECUPERADO*\n\n👤 *Cliente:* {nombre}\n🆔 *SN:* `{sn}`\nStatus: ONLINE"
             enviar_alerta_tg(msg)
             st.session_state.fallas_activas.remove(sn)
-            st.toast(f"Cliente recuperado: {nombre}", icon="✅")
 
-    # --- INTERFAZ DEL DASHBOARD ---
+    # --- INTERFAZ ---
     c1, c2, c3 = st.columns(3)
-    c1.metric("ONUs Totales", len(df))
+    c1.metric("Total ONUs", len(df))
     online = len(df[df['status'].str.lower() == 'online'])
     c2.metric("Online ✅", online)
-    c3.metric("Fallas Activas 🚨", len(st.session_state.fallas_activas), delta_color="inverse")
+    c3.metric("Fallas 🚨", len(st.session_state.fallas_activas), delta_color="inverse")
 
     st.markdown("---")
-    st.subheader("📋 Monitor de Estado en Tiempo Real")
+    st.subheader("📋 Estado Actual de Clientes")
     
-    # Mostramos la tabla filtrando las columnas que te interesan
     df['Status_Icon'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
     st.dataframe(
         df[['Status_Icon', 'onu', 'sn', 'board', 'port', 'status', 'last_status_change']].rename(
@@ -100,10 +94,9 @@ if onus is not None:
         ),
         use_container_width=True, hide_index=True
     )
-
 else:
-    st.error("Error de conexión. Revisa el Token.")
+    st.error("❌ Sin conexión con SmartOLT.")
 
-# Auto-refresco cada 60 segundos
+# Refresco
 time.sleep(60)
 st.rerun()
