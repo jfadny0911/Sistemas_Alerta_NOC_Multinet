@@ -7,16 +7,21 @@ from urllib.parse import urlparse
 # --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Multinet NOC Intelligence", page_icon="📡", layout="wide")
 
-# 1. Credenciales
+# Credenciales
 URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
 TOKEN = st.secrets["smartolt"]["token"].strip()
 
-# 2. MAPA DE COORDINADAS POR ZONE_ID
-# Reemplaza los números (1, 2, 3) por los IDs de zona que veas en tu SmartOLT
-ZONAS_GPS = {
-    "1": [13.69, -89.21], # Ejemplo: Zona San Salvador
-    "2": [13.71, -89.20], # Ejemplo: Zona Norte
-    "default": [13.68, -89.18]
+# --- CONFIGURACIÓN DE COORDENADAS (PON AQUÍ EL GPS REAL) ---
+# He sacado estos nombres de tu captura de pantalla
+MAPA_ZONAS = {
+    "Conchalio": [13.4912, -89.3789],
+    "Conchalito": [13.4890, -89.3820],
+    "Islas de San Blas": [13.4850, -89.3500],
+    "Islas El Encanto": [13.4820, -89.3400],
+    "Julupe": [13.5000, -89.4000],
+    "La Puntilla": [13.3000, -88.9000],
+    "Laguna Sur": [13.4000, -89.1000],
+    "Default": [13.5000, -89.3000] # Punto medio por si no hay match
 }
 
 st.title("🛰️ Multinet NOC: Inteligencia de Red")
@@ -38,72 +43,70 @@ def llamar_api(endpoint):
 with st.spinner('Sincronizando con SmartOLT...'):
     onus = llamar_api("onu/get_onus_statuses")
     olts = llamar_api("system/get_olts")
+    zonas_lista = llamar_api("system/get_zones") # Traemos los nombres de las zonas
 
-if onus:
-    df = pd.DataFrame(onus)
-    
-    # --- PROCESAMIENTO DE SATURACIÓN ---
-    # Creamos una columna única de Puerto PON combinando Board y Port
-    df['pon_completo'] = "B-" + df['board'].astype(str) + "/P-" + df['port'].astype(str)
-    
-    # Agrupamos para ver cuántos clientes hay por puerto
-    sat = df.groupby(['olt_id', 'pon_completo']).size().reset_index(name='clientes')
-    sat['estado'] = sat['clientes'].apply(lambda x: "🔴 CRÍTICO" if x >= 60 else ("🟡 ALTA" if x >= 45 else "🟢 OK"))
+if onus and zonas_lista:
+    df_onus = pd.DataFrame(onus)
+    df_zonas = pd.DataFrame(zonas_lista) # Contiene 'id' y 'name'
 
-    # --- MÉTRICAS PRINCIPALES ---
+    # 1. Unimos ONUs con Nombres de Zonas
+    # Convertimos zone_id a string para asegurar el match
+    df_onus['zone_id'] = df_onus['zone_id'].astype(str)
+    df_zonas['id'] = df_zonas['id'].astype(str)
+    
+    # Cruzamos datos para tener el nombre de la zona en el dataframe de clientes
+    df = pd.merge(df_onus, df_zonas[['id', 'name']], left_on='zone_id', right_on='id', how='left')
+    
+    # 2. Preparar datos para el Mapa
+    stats_zonas = df.groupby('name').size().reset_index(name='total_clientes')
+    
+    map_data = []
+    for index, row in stats_zonas.iterrows():
+        nombre = row['name']
+        coords = MAPA_ZONAS.get(nombre, MAPA_ZONAS["Default"])
+        map_data.append({
+            'name': nombre,
+            'lat': coords[0],
+            'lon': coords[1],
+            'clientes': row['total_clientes']
+        })
+    df_mapa = pd.DataFrame(map_data)
+
+    # --- MÉTRICAS ---
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Clientes", len(df))
+    c1.metric("Total ONUs", len(df))
     online = len(df[df['status'].str.lower() == 'online'])
     c2.metric("Online ✅", online)
     c3.metric("Fallas ❌", len(df) - online, delta_color="inverse")
-    c4.metric("Puertos Saturados", len(sat[sat['clientes'] >= 60]))
-
-    st.markdown("---")
-
-    # --- SECCIÓN DE MAPA ---
-    st.subheader("📍 Mapa de Estado por Zonas")
     
-    # Preparamos datos del mapa basados en zone_id
-    map_list = []
-    for zone, coords in ZONAS_GPS.items():
-        count = len(df[df['zone_id'].astype(str) == zone])
-        if count > 0:
-            map_list.append({
-                'lat': coords[0], 'lon': coords[1], 
-                'clientes': count, 'zona': f"Zona ID: {zone}"
-            })
-    
-    if map_list:
-        st.map(pd.DataFrame(map_list), latitude='lat', longitude='lon', size='clientes')
-    else:
-        st.info("Configura los IDs de tus zonas en el código para ver el mapa.")
+    # Saturación
+    df['pon'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
+    sat = df.groupby(['olt_id', 'pon']).size().reset_index(name='cnt')
+    c4.metric("Puertos >60", len(sat[sat['cnt'] >= 60]))
 
-    # --- SECCIÓN DE TRÁFICO Y PUERTOS ---
+    # --- MAPA REAL ---
+    st.subheader("📍 Mapa de Distribución por Zonas")
+    st.map(df_mapa, latitude='lat', longitude='lon', size='clientes', color="#29b5e8")
+
+    # --- DETALLE DE PUERTOS Y SATURACIÓN ---
     st.markdown("---")
-    col_izq, col_der = st.columns([1, 1])
-
+    col_izq, col_der = st.columns(2)
+    
     with col_izq:
-        st.subheader("📊 Carga por Puerto (Saturación)")
-        # Gráfico de carga
-        st.bar_chart(sat.set_index('pon_completo')['clientes'])
-        st.dataframe(sat.sort_values(by='clientes', ascending=False), use_container_width=True, hide_index=True)
-
+        st.subheader("📊 Carga de Clientes por Puerto PON")
+        st.bar_chart(sat.set_index('pon')['cnt'])
+    
     with col_der:
-        st.subheader("📉 Tráfico Estimado")
-        st.info("Nota: La API `get_onus_statuses` no devuelve Mbps reales por puerto.")
-        st.write("Carga estimada según densidad de clientes:")
-        # Simulación de carga (Mbps estimados: clientes * 5Mbps de promedio)
-        sat['Mbps_Estimados'] = sat['clientes'] * 5 
-        st.line_chart(sat.set_index('pon_completo')['Mbps_Estimados'])
+        st.subheader("⚠️ Top Puertos Saturados")
+        st.dataframe(sat.sort_values(by='cnt', ascending=False).head(10), use_container_width=True, hide_index=True)
 
     # --- TABLA DE FALLAS ---
-    with st.expander("🔍 Ver Detalle de Clientes Offline"):
+    with st.expander("🔍 Detalle de Clientes Offline"):
         df_off = df[df['status'].str.lower() != 'online']
-        st.dataframe(df_off[['sn', 'olt_id', 'board', 'port', 'last_status_change']], use_container_width=True)
+        st.dataframe(df_off[['sn', 'name', 'pon', 'last_status_change']], use_container_width=True)
 
 else:
-    st.error("No se recibieron datos. Verifica el Token.")
+    st.error("No se pudo obtener la lista de zonas o clientes.")
 
-# Refresh
 time.sleep(60)
 st.rerun()
