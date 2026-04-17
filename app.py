@@ -2,92 +2,124 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
+import numpy as np
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="NOC Multinet - SmartOLT", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Multinet NOC Intelligence", page_icon="📡", layout="wide")
 
-# 1. Carga de Secretos con Limpieza
-try:
-    URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
-    TOKEN = st.secrets["smartolt"]["token"].strip()
-except Exception as e:
-    st.error("❌ No se encontraron los secretos [smartolt] en la configuración.")
-    st.stop()
+# 1. Credenciales (Asegúrate de que en tus Secrets la URL sea solo el dominio)
+URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
+TOKEN = st.secrets["smartolt"]["token"].strip()
 
-st.title("📡 Dashboard NOC Multinet")
+# 2. CONFIGURACIÓN DE MAPA (Edita las coordenadas de tus zonas aquí)
+# Nombre de la Zona en SmartOLT -> [Latitud, Longitud]
+COORDENADAS_ZONAS = {
+    "Norte": [13.70, -89.20],
+    "Sur": [13.65, -89.15],
+    "Centro": [13.69, -89.21],
+    "Default": [13.68, -89.18] # Coordenada base si no encuentra la zona
+}
 
-def llamar_smartolt(endpoint):
-    # Usamos el endpoint que encontraste: onu/get_onus_statuses
+st.title("🛰️ Multinet NOC: Inteligencia de Red y Tráfico")
+
+# --- FUNCIÓN DE CONEXIÓN ---
+def llamar_smartolt(endpoint, params=None):
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': TOKEN}
-    
     try:
-        # Probamos con POST (estándar de SmartOLT)
-        r = requests.post(url, headers=headers, timeout=15)
-        
-        # Si el servidor prefiere GET, hacemos el cambio automático
+        # Intentamos con POST
+        r = requests.post(url, headers=headers, json=params, timeout=15)
         if r.status_code == 405:
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=headers, params=params, timeout=15)
             
         if r.status_code == 200:
             res = r.json()
-            if res.get('status'):
-                return res.get('response')
-            else:
-                st.sidebar.warning(f"Respuesta SmartOLT: {res.get('error')}")
-        else:
-            st.sidebar.error(f"Error {r.status_code} en {endpoint}")
-    except Exception as e:
-        st.sidebar.error(f"Error de red: {e}")
+            return res.get('response') if res.get('status') else None
+    except:
+        return None
     return None
 
 # --- OBTENCIÓN DE DATOS ---
-with st.spinner('Sincronizando estados de ONUs...'):
-    # CAMBIO CLAVE: Usando el endpoint correcto
+with st.spinner('Sincronizando datos masivos...'):
     onus = llamar_smartolt("onu/get_onus_statuses")
     olts = llamar_smartolt("system/get_olts")
 
-# --- INTERFAZ ---
-if onus is not None:
-    # Procesar datos
-    total = len(onus)
-    online = len([o for o in onus if str(o.get('status')).lower() == 'online'])
-    offline = total - online
+if onus and olts:
+    # --- PROCESAMIENTO DE DATOS ---
+    df_onus = pd.DataFrame(onus)
     
-    # Métricas principales
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Clientes Totales", total)
-    c2.metric("Online ✅", online)
-    c3.metric("Fallas ❌", offline, delta_color="inverse")
+    # A. Cálculo de Saturación por Puerto
+    # Agrupamos por OLT y Puerto para contar clientes
+    saturacion = df_onus.groupby(['olt_name', 'pon_port']).size().reset_index(name='clientes')
+    # Definimos 60 como límite de saturación (puedes cambiarlo)
+    LIMITE_PON = 60
+    puertos_saturados = saturacion[saturacion['clientes'] >= LIMITE_PON]
 
-    st.markdown("---")
+    # B. Preparación de Datos para el Mapa
+    map_data = []
+    for o in olts:
+        nombre_olt = o.get('name', 'Desconocida')
+        # Buscamos si el nombre de la OLT contiene alguna de nuestras zonas
+        lat, lon = COORDENADAS_ZONAS["Default"]
+        for zona, coords in COORDENADAS_ZONAS.items():
+            if zona.lower() in nombre_olt.lower():
+                lat, lon = coords
+                break
+        
+        map_data.append({
+            "name": nombre_olt,
+            "latitude": lat,
+            "longitude": lon,
+            "status": o.get('status')
+        })
+    df_mapa = pd.DataFrame(map_data)
 
-    # Tabla de fallas
-    st.subheader("🔴 Clientes fuera de línea")
-    df = pd.DataFrame(onus)
+    # --- DISEÑO DEL DASHBOARD ---
     
-    # En este endpoint, SmartOLT a veces usa nombres de columnas distintos
-    # Filtramos por status != online
-    df_off = df[df['status'].str.lower() != 'online'].copy()
-    
-    if not df_off.empty:
-        # Intentamos mostrar las columnas más útiles
-        columnas_posibles = ['name', 'sn', 'olt_name', 'pon_port', 'signal', 'last_online_at']
-        existentes = [c for c in columnas_posibles if c in df_off.columns]
-        st.dataframe(df_off[existentes], use_container_width=True, hide_index=True)
-    else:
-        st.success("✅ No se detectan clientes offline en este momento.")
+    # Fila 1: Métricas de Tráfico y Saturación
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total ONUs", len(df_onus))
+    with col2:
+        online = len(df_onus[df_onus['status'].lower() == 'online'])
+        st.metric("Clientes Online", online)
+    with col3:
+        st.metric("Puertos Críticos", len(puertos_saturados), delta="Saturación >60", delta_color="inverse")
+    with col4:
+        # Nota: El tráfico total real requiere sumar los puertos, aquí mostramos un estimado o estado
+        st.metric("OLTs Activas", len([o for o in olts if o.get('status') == 'online']))
 
-    # OLTs
-    if olts:
-        with st.expander("🏢 Estado de Cabeceras (OLTs)"):
-            for o in olts:
-                st.write(f"🖥️ **{o.get('name')}** - Status: {o.get('status')}")
+    # Fila 2: Mapa y Saturación
+    c_mapa, c_sat = st.columns([2, 1])
+    
+    with c_mapa:
+        st.subheader("📍 Ubicación Real de OLTs")
+        st.map(df_mapa, latitude="latitude", longitude="longitude", color="#FF0000" if "offline" in str(df_mapa['status']) else "#00FF00")
+
+    with c_sat:
+        st.subheader("⚠️ Puertos Saturados")
+        if not puertos_saturados.empty:
+            st.warning("Los siguientes puertos están al límite:")
+            st.table(puertos_saturados.rename(columns={'olt_name': 'OLT', 'pon_port': 'Puerto', 'clientes': 'ONUs'}))
+        else:
+            st.success("Carga de puertos balanceada.")
+
+    # Fila 3: Detalle de Tráfico y Fallas
+    tab1, tab2 = st.tabs(["📊 Tráfico por OLT", "🔴 Clientes Offline"])
+    
+    with tab1:
+        st.subheader("Consumo de Megas por Puerto (Estimado por Clientes)")
+        # Gráfico de barras de clientes por puerto como indicador de carga
+        st.bar_chart(saturacion.set_index('pon_port')['clientes'])
+        st.info("💡 Tip: Para ver Megas reales (Mbps), SmartOLT requiere consultar el tráfico puerto por puerto vía SNMP o API de Tráfico Individual.")
+
+    with tab2:
+        df_off = df_onus[df_onus['status'].lower() != 'online']
+        st.dataframe(df_off[['name', 'sn', 'olt_name', 'pon_port', 'signal', 'last_online_at']], use_container_width=True)
+
 else:
-    st.error("❌ Conexión fallida.")
-    st.info(f"Estamos consultando a: `{URL_BASE}/api/onu/get_onus_statuses`")
-    st.write("Verifica que el API Key tenga permisos suficientes en el panel de SmartOLT.")
+    st.error("No se pudo obtener la información. Verifica la API y el Token.")
 
-# Refresco automático
+# Auto-refresco
 time.sleep(60)
 st.rerun()
