@@ -3,48 +3,47 @@ import pandas as pd
 import requests
 import time
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="NOC Multinet", page_icon="📡", layout="wide")
 
-# Limpieza radical de URL y Token
+# 1. Limpieza de URL y Token desde los Secrets
 URL_BASE = str(st.secrets['smartolt']['url']).strip().rstrip('/')
 TOKEN = str(st.secrets['smartolt']['token']).strip()
 
-st.title("📡 Monitor de Red Multinet")
+st.title("📡 Dashboard NOC Multinet")
 
-def consulta_inteligente(endpoint):
-    """Prueba GET y POST para encontrar el método correcto del servidor"""
+def llamar_api(endpoint):
+    """Prueba la conexión de forma agresiva"""
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': TOKEN}
     
-    # 1. Intentamos con GET
+    # Intentamos primero con POST (Estándar de SmartOLT)
     try:
-        r_get = requests.get(url, headers=headers, timeout=10)
-        if r_get.status_code == 200:
-            data = r_get.json()
-            if data.get('status') == True:
-                return data.get('response')
-    except:
-        pass
-
-    # 2. Si falló el anterior, intentamos con POST
-    try:
-        r_post = requests.post(url, headers=headers, timeout=10)
-        if r_post.status_code == 200:
-            data = r_post.json()
-            if data.get('status') == True:
-                return data.get('response')
-    except:
-        pass
-    
+        r = requests.post(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            res = r.json()
+            if res.get('status'): return res.get('response')
+        
+        # Si da 405, intentamos con GET
+        if r.status_code == 405:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code == 200:
+                res = r.json()
+                if res.get('status'): return res.get('response')
+                
+        # Si llegamos aquí, mostramos el error técnico para debug
+        st.sidebar.error(f"Error técnico en {endpoint}: {r.status_code}")
+        st.sidebar.write(f"Respuesta: {r.text}")
+    except Exception as e:
+        st.sidebar.error(f"Falla de red: {e}")
     return None
 
 # --- OBTENER DATOS ---
-with st.spinner('Conectando con la OLT...'):
-    onus = consulta_inteligente("onu/get_all")
-    olts = consulta_inteligente("system/get_olts")
+with st.spinner('Consultando SmartOLT...'):
+    onus = llamar_api("onu/get_all")
+    olts = llamar_api("system/get_olts")
 
-# --- MOSTRAR RESULTADOS ---
+# --- INTERFAZ DE USUARIO ---
 if onus is not None:
     # Métricas
     total = len(onus)
@@ -57,32 +56,33 @@ if onus is not None:
     c3.metric("Fallas ❌", offline, delta_color="inverse")
 
     st.markdown("---")
-    
+
     # Tabla de fallas
-    st.subheader("🔴 Detalle de Clientes Offline")
+    st.subheader("🔴 Clientes fuera de línea")
     df = pd.DataFrame(onus)
-    df_falla = df[df['status'].str.lower() != 'online'].copy()
+    df_off = df[df['status'].str.lower() != 'online'].copy()
     
-    if not df_falla.empty:
-        cols = ['name', 'sn', 'olt_name', 'pon_port', 'signal']
-        existentes = [c for c in cols if c in df_falla.columns]
-        st.dataframe(df_falla[existentes], use_container_width=True, hide_index=True)
+    if not df_off.empty:
+        # Mostramos columnas clave
+        cols = [c for c in ['name', 'sn', 'olt_name', 'pon_port', 'signal'] if c in df_off.columns]
+        st.dataframe(df_off[cols], use_container_width=True, hide_index=True)
     else:
-        st.success("No hay fallas reportadas.")
+        st.success("✅ Todos los clientes están navegando correctamente.")
 
-    # Estado de OLTs
+    # OLTs
     if olts:
-        with st.expander("🏢 Estado de Cabeceras (OLTs)"):
+        with st.expander("🏢 Ver estado de OLTs"):
             for o in olts:
-                st.write(f"🖥️ **{o.get('name')}** - {o.get('status').upper()}")
-else:
-    # --- MENSAJE DE DIAGNÓSTICO SI NADA FUNCIONA ---
-    st.error("❌ No se pudo conectar con la API.")
-    st.warning("⚠️ Posibles causas:")
-    st.write(f"1. **URL en Secrets:** Asegúrate de que sea exactamente `https://multinet.smartolt.com` (sin nada extra al final).")
-    st.write("2. **Token:** Verifica que no tenga espacios al principio o al final.")
-    st.write("3. **Permisos:** En tu panel de SmartOLT, asegúrate de que la API Key sea 'Read & Write' o 'Read-only'.")
+                st.write(f"🖥️ **{o.get('name')}** - Status: {o.get('status')}")
 
-# Refresco
+else:
+    # ESTO SALDRÁ SI SIGUE EL ERROR
+    st.error("❌ No hay conexión con la API.")
+    st.info("💡 REVISA ESTO:")
+    st.write(f"1. Tu URL actual es: `{URL_BASE}`")
+    st.write(f"2. Tu Token termina en: `...{TOKEN[-4:]}`")
+    st.write("3. Asegúrate de que en SmartOLT, la API Key no tenga restricciones de IP (debe decir `0.0.0.0`).")
+
+# Refresco cada minuto
 time.sleep(60)
 st.rerun()
