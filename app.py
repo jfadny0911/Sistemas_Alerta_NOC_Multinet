@@ -267,13 +267,29 @@ def detectar_fallas_masivas(df_offline: pd.DataFrame) -> list:
 # ══════════════════════════════════════════════════════════════
 # OBTENER DATOS
 # ══════════════════════════════════════════════════════════════
+def get_olts() -> list:
+    """Prueba múltiples endpoints conocidos de SmartOLT."""
+    for ep in ("system/get_olts", "olt/get_olts", "olts", "system/olts"):
+        r = api_get(ep)
+        if r and isinstance(r, list) and len(r) > 0:
+            return r
+    return []
+
+def get_onus_statuses() -> list:
+    """Prueba múltiples endpoints de estado de ONUs."""
+    for ep in ("onu/get_onus_statuses", "onu/get_all_statuses", "onu/statuses"):
+        r = api_get(ep)
+        if r and isinstance(r, list) and len(r) > 0:
+            return r
+    return []
+
 with st.spinner("🔄 Conectando con SmartOLT..."):
     with ThreadPoolExecutor() as ex:
-        f_status = ex.submit(api_get, "onu/get_onus_statuses")
-        f_olts   = ex.submit(api_get, "olt/get_olts")
+        f_status = ex.submit(get_onus_statuses)
+        f_olts   = ex.submit(get_olts)
         f_zones  = ex.submit(api_get, "system/get_zones")
         f_unconf = ex.submit(api_get, "onu/get_unconfigured")
-    raw_status = f_status.result()
+    raw_status = f_status.result() or []
     olts       = f_olts.result()   or []
     zones      = f_zones.result()  or []
     unconf     = f_unconf.result() or []
@@ -299,6 +315,7 @@ with st.sidebar:
         st.caption("Sin sincronización aún")
 
     st.caption(f"Clientes en caché: **{len(db_clientes):,}**")
+    st.caption(f"OLTs detectadas: **{len(olts)}**")
 
     if st.button("🔄 Sincronizar (OLT por OLT)", use_container_width=True, type="primary"):
         if olts:
@@ -307,7 +324,25 @@ with st.sidebar:
             bar.empty()
             st.success(f"✅ {len(db_clientes):,} clientes sincronizados")
         else:
-            st.warning("No se encontraron OLTs")
+            st.error("❌ Sin OLTs — revisa diagnóstico ↓")
+
+    # Diagnóstico de API
+    with st.expander("🔍 Diagnóstico API"):
+        st.caption(f"URL base: `{URL_BASE}`")
+        endpoints_test = [
+            ("OLTs",    "system/get_olts"),
+            ("OLTs v2", "olt/get_olts"),
+            ("ONUs st", "onu/get_onus_statuses"),
+            ("Zonas",   "system/get_zones"),
+        ]
+        for label, ep in endpoints_test:
+            r = api_get(ep)
+            if r and isinstance(r, list):
+                st.success(f"✅ `{ep}` → {len(r)} items")
+            elif r:
+                st.warning(f"⚠️ `{ep}` → respuesta inesperada")
+            else:
+                st.error(f"❌ `{ep}` → sin respuesta")
 
     st.markdown("---")
 
