@@ -4,31 +4,35 @@ import requests
 import time
 from datetime import datetime
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Multinet NOC - Reporte Global", page_icon="📊", layout="wide")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="Multinet NOC - Ultra Intelligence", page_icon="📡", layout="wide")
 
-# 1. Credenciales
+# 1. Carga de Credenciales Segura
 try:
     URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
     SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
-    TG_TOKEN = st.secrets["telegram"]["token"]
+    TG_TOKEN = st.secrets["telegram"]["token"] # Tu secreto dice 'token'
     TG_CHAT = st.secrets["telegram"]["chat_id"]
 except Exception as e:
-    st.error(f"❌ Error en Secrets: {e}")
+    st.error(f"❌ Error crítico en Secrets: Falta la llave {e}")
     st.stop()
 
-# --- MEMORIA DE ESTADO (Para no repetir el mismo reporte exacto) ---
-if 'ultimo_hash_fallas' not in st.session_state:
-    st.session_state.ultimo_hash_fallas = ""
+# --- MEMORIA DE ESTADO ---
+if 'ultimo_estado_red' not in st.session_state:
+    st.session_state.ultimo_estado_red = ""
 
-st.title("🛰️ Multinet NOC: Reporte de Incidencias Detallado")
+st.title("🛰️ Multinet NOC: Centro de Mando Pro")
 
-# --- FUNCIONES ---
+# --- FUNCIONES NÚCLEO ---
 def enviar_tg(mensaje):
+    """Envía mensaje a Telegram y devuelve si fue exitoso"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT, "text": mensaje, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload, timeout=10)
-    except: pass
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        return r.status_code == 200, r.text
+    except Exception as e:
+        return False, str(e)
 
 def llamar_api(endpoint):
     url = f"{URL_BASE}/api/{endpoint}"
@@ -39,77 +43,108 @@ def llamar_api(endpoint):
         return r.json().get('response') if r.status_code == 200 else None
     except: return None
 
-# --- PROCESO DE ANÁLISIS ---
-with st.spinner('Generando reporte de red...'):
+# --- BARRA LATERAL: HERRAMIENTAS DE PRUEBA ---
+with st.sidebar:
+    st.header("🛠️ Herramientas")
+    if st.button("🔌 Probar Conexión Telegram"):
+        success, response = enviar_tg("🔔 *Prueba de Conexión:* El Bot de Multinet está vinculado correctamente.")
+        if success: st.success("¡Mensaje enviado!")
+        else: st.error(f"Error: {response}")
+
+# --- PROCESO DE DATOS ---
+with st.spinner('Analizando red en tiempo real...'):
     onus = llamar_api("onu/get_onus_statuses")
+    zonas = llamar_api("system/get_zones")
 
 if onus is not None:
     df = pd.DataFrame(onus)
-    df['PUERTO'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
-    df['CLIENTE'] = df['onu'].fillna(df['sn'])
     
-    # Filtramos solo los caídos
+    # Unir con nombres de zonas
+    if zonas:
+        df_z = pd.DataFrame(zonas)
+        df_z['id'] = df_z['id'].astype(str)
+        df['zone_id'] = df['zone_id'].astype(str)
+        df = pd.merge(df, df_z[['id', 'name']], left_on='zone_id', right_on='id', how='left')
+    
+    df['Puerto'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
+    df['NAME_ID'] = df['onu'].fillna(df['sn'])
+    df['Zona_Txt'] = df['name'].fillna("Sin Zona")
+    
+    # Filtro de caídos
     df_off = df[df['status'].str.lower() != 'online'].copy()
     
-    # Creamos un "Identificador" de la falla actual para saber si algo cambió
-    hash_actual = str(sorted(df_off['sn'].tolist()))
+    # Lógica de Notificación: Comparamos si el set de SN caídos cambió
+    hash_fallas = "-".join(sorted(df_off['sn'].astype(str).tolist()))
     
-    if hash_actual != st.session_state.ultimo_hash_fallas:
+    if hash_fallas != st.session_state.ultimo_estado_red:
         if not df_off.empty:
-            # --- CONSTRUCCIÓN DEL REPORTE EXTENSO ---
-            ahora = datetime.now().strftime('%d/%m/%Y %H:%M')
-            reporte = f"🚨 *INFORME GLOBAL DE INCIDENCIAS*\n📅 _Fecha: {ahora}_\n"
-            reporte += "------------------------------------------\n\n"
+            # CONSTRUCCIÓN DEL REPORTE EXTENSO
+            fecha_act = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+            msg = f"🚨 *REPORTE DE INCIDENCIAS MULTINET*\n"
+            msg += f"📅 _Sincronización: {fecha_act}_\n"
+            msg += "------------------------------------------\n\n"
             
-            # Agrupamos por OLT y Puerto
-            olts_afectadas = df_off['olt_id'].unique()
-            
-            for olt in olts_afectadas:
-                reporte += f"🏢 *OLT:* {olt}\n"
+            # Agrupar por OLT
+            for olt in df_off['olt_id'].unique():
                 df_olt = df_off[df_off['olt_id'] == olt]
+                msg += f"🏢 *OLT:* {olt}\n"
                 
-                puertos_afectados = df_olt['PUERTO'].unique()
-                for p in puertos_afectados:
-                    df_p = df_olt[df_olt['PUERTO'] == p]
-                    cant = len(df_p)
-                    reporte += f"  🔌 *Puerto:* {p} ({cant} caídos)\n"
-                    
-                    # Listamos los nombres (IDs) de los clientes en ese puerto
-                    nombres = ", ".join(df_p['CLIENTE'].astype(str).tolist())
-                    reporte += f"  👤 _Clientes:_ {nombres}\n"
-                reporte += "\n"
+                # Agrupar por Puerto dentro de la OLT
+                for p in df_olt['Puerto'].unique():
+                    df_p = df_olt[df_olt['Puerto'] == p]
+                    nombres = ", ".join(df_p['NAME_ID'].astype(str).tolist())
+                    msg += f"  🔌 *Puerto:* {p} 📉 *Caídos:* ({len(df_p)})\n"
+                    msg += f"  👥 _Clientes:_ {nombres}\n"
+                msg += "\n"
             
-            reporte += "------------------------------------------\n"
-            reporte += f"📉 *TOTAL RED OFFLINE:* {len(df_off)} clientes."
+            msg += "------------------------------------------\n"
+            msg += f"📊 *Resumen:* {len(df_off)} clientes fuera de servicio."
             
-            # Enviar a Telegram
-            enviar_tg(reporte)
+            # Enviar y guardar estado
+            enviar_tg(msg)
+            st.session_state.ultimo_estado_red = hash_fallas
         else:
-            # Si ya no hay fallas y antes había, avisamos que la red está limpia
-            if st.session_state.ultimo_hash_fallas != "":
-                enviar_tg("✅ *RED RESTABLECIDA TOTALMENTE*\nTodos los servicios están operando con normalidad.")
+            # Si se recuperaron todos
+            if st.session_state.ultimo_estado_red != "":
+                enviar_tg("✅ *RED ESTABLE:* Todos los servicios se han restablecido.")
+                st.session_state.ultimo_estado_red = ""
+
+    # --- INTERFAZ DEL DASHBOARD (TODA LA INFO) ---
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Base Total", len(df))
+    k2.metric("Online ✅", len(df[df['status'].str.lower() == 'online']))
+    k3.metric("Fallas 🚨", len(df_off), delta_color="inverse")
+
+    st.markdown("---")
+    
+    tab_mon, tab_nuevas = st.tabs(["🖥️ Monitor General", "🆕 ONUs por Autorizar"])
+    
+    with tab_mon:
+        # Buscador
+        busc = st.text_input("🔍 Buscar por SN o Name", "")
+        df_show = df.copy()
+        if busc:
+            df_show = df_show[df_show['sn'].str.contains(busc, case=False) | df_show['NAME_ID'].str.contains(busc, case=False)]
         
-        # Guardamos el estado para no repetir
-        st.session_state.ultimo_hash_fallas = hash_actual
+        df_show['Icon'] = df_show['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
+        st.dataframe(
+            df_show[['Icon', 'NAME_ID', 'sn', 'Zona_Txt', 'Puerto', 'status', 'last_status_change']].rename(
+                columns={'NAME_ID': 'NAME (Código)', 'sn': 'Serie SN', 'status': 'Estado'}
+            ),
+            use_container_width=True, hide_index=True
+        )
 
-    # --- INTERFAZ DEL DASHBOARD ---
-    st.subheader("📋 Vista de Monitoreo")
-    df['Estado'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
-    st.dataframe(
-        df[['Estado', 'CLIENTE', 'sn', 'PUERTO', 'status', 'last_status_change']].rename(
-            columns={'CLIENTE': 'NAME (ID)', 'sn': 'Serie (SN)', 'status': 'Detalle'}
-        ),
-        use_container_width=True, hide_index=True
-    )
-
-    # Resumen visual en el Dashboard
-    c1, c2 = st.columns(2)
-    c1.metric("Clientes Totales", len(df))
-    c2.metric("Total Offline", len(df_off), delta_color="inverse")
+    with tab_nuevas:
+        unconf = llamar_api("onu/get_unconfigured")
+        if unconf:
+            st.success(f"Hay {len(unconf)} ONUs nuevas detectadas.")
+            st.dataframe(pd.DataFrame(unconf), use_container_width=True)
+        else:
+            st.write("No hay equipos pendientes.")
 
 else:
-    st.error("❌ No hay comunicación con SmartOLT.")
+    st.error("❌ No se pudo conectar con la API de SmartOLT.")
 
-# Auto-refresco
+# Auto-refresco cada 60 segundos
 time.sleep(60)
 st.rerun()
