@@ -3,10 +3,9 @@ import pandas as pd
 import requests
 import time
 from datetime import datetime
-import plotly.express as px
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Multinet NOC - Enterprise", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Multinet NOC - Hybrid Intelligence", page_icon="📡", layout="wide")
 
 # 1. Credenciales
 try:
@@ -15,98 +14,118 @@ try:
     TG_TOKEN = st.secrets["telegram"]["token"]
     TG_CHAT = st.secrets["telegram"]["chat_id"]
 except:
-    st.error("❌ Configura los Secrets correctamente.")
+    st.error("❌ Revisa tus Secrets [smartolt] y [telegram].")
     st.stop()
 
-# Persistencia de memoria
+# --- MEMORIA DE SESIÓN ---
 if 'registro_caidas' not in st.session_state: st.session_state.registro_caidas = {}
-if 'contador_flapping' not in st.session_state: st.session_state.contador_flapping = {}
+if 'nombres_cache' not in st.session_state: st.session_state.nombres_cache = {}
+if 'df_avanzado' not in st.session_state: st.session_state.df_avanzado = None
 
-st.title("🛡️ Multinet NOC: Gestión Proactiva")
+st.title("🛰️ Multinet NOC: Gestión Híbrida Inteligente")
 
-def llamar_api(endpoint):
+# --- FUNCIONES CORE ---
+def enviar_tg(mensaje):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TG_CHAT, "text": mensaje, "parse_mode": "Markdown"})
+
+def llamar_api(endpoint, timeout=15):
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': SMART_TOKEN}
     try:
-        # Aumentamos el timeout a 30 segundos para procesos pesados
-        r = requests.post(url, headers=headers, timeout=30)
-        if r.status_code == 405: 
-            r = requests.get(url, headers=headers, timeout=30)
+        r = requests.post(url, headers=headers, timeout=timeout)
+        if r.status_code == 405: r = requests.get(url, headers=headers, timeout=timeout)
         return r.json().get('response') if r.status_code == 200 else None
-    except Exception as e:
-        return None
+    except: return None
 
-# --- MOTOR DE DATOS INTELIGENTE ---
-with st.spinner('Sincronizando con SmartOLT (Modo Inteligente)...'):
-    # INTENTO 1: Información avanzada (dBm, etc)
-    onus_data = llamar_api("onu/get_all")
-    modo_avanzado = True
-    
-    # FALLBACK: Si falla el avanzado, usamos el básico
-    if onus_data is None:
-        onus_data = llamar_api("onu/get_onus_statuses")
-        modo_avanzado = False
-        st.warning("⚠️ Usando Modo Básico: La API avanzada no respondió a tiempo.")
+# --- BARRA LATERAL: ESCANEO DE SEÑALES ---
+with st.sidebar:
+    st.header("⚙️ Herramientas Pro")
+    st.write("Si el modo avanzado falla, usa este botón para forzar la lectura de dBm y Nombres.")
+    if st.button("🔍 Realizar Escaneo Profundo (dBm)"):
+        with st.spinner("Consultando señales ópticas... (Puede tardar)"):
+            data_pro = llamar_api("onu/get_all", timeout=60) # Timeout largo de 1 min
+            if data_pro:
+                st.session_state.df_avanzado = pd.DataFrame(data_pro)
+                # Guardamos nombres en caché
+                for _, r in st.session_state.df_avanzado.iterrows():
+                    st.session_state.nombres_cache[r['sn']] = r.get('name', r['sn'])
+                st.success("✅ ¡Datos de señal y nombres actualizados!")
+            else:
+                st.error("❌ El servidor SmartOLT sigue sin responder a la consulta pesada.")
 
-    olts = llamar_api("system/get_olts")
+# --- PROCESO DE MONITOREO RÁPIDO (Dashboard) ---
+with st.spinner('Sincronizando estado de red...'):
+    onus_raw = llamar_api("onu/get_onus_statuses")
     unconfigured = llamar_api("onu/get_unconfigured")
+    olts = llamar_api("system/get_olts")
 
-if onus_data:
-    df = pd.DataFrame(onus_data)
+if onus_raw:
+    df = pd.DataFrame(onus_raw)
     df['PUERTO'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
+    # Buscamos el nombre en el caché si existe, si no usamos el SN
+    df['CLIENTE'] = df['sn'].apply(lambda x: st.session_state.nombres_cache.get(x, x))
     
-    # Manejo de nombres: get_all usa 'name', get_onus_statuses usa 'onu'
-    nombre_col = 'name' if 'name' in df.columns else 'onu'
-    df['CLIENTE'] = df[nombre_col].fillna(df['sn'])
+    # 1. LÓGICA DE ALERTAS INTELIGENTES (Mismo nivel que antes)
+    df_off = df[df['status'].str.lower() != 'online'].copy()
+    ahora_dt = datetime.now()
+    
+    for _, row in df.iterrows():
+        sn, nombre = row['sn'], row['CLIENTE']
+        status = str(row['status']).lower()
+        
+        if status != 'online' and sn not in st.session_state.registro_caidas:
+            st.session_state.registro_caidas[sn] = ahora_dt
+            # Detectar causa
+            causa = "🔌 Desconexión / Energía" if "pwfail" in status else "✂️ Corte de Fibra (LOS)"
+            enviar_tg(f"🔴 *FALLA*\n👤 {nombre}\n📍 Puerto: {row['PUERTO']}\n❓ Causa: {causa}")
+            
+        elif status == 'online' and sn in st.session_state.registro_caidas:
+            inicio = st.session_state.registro_caidas[sn]
+            duracion = str(ahora_dt - inicio).split('.')[0]
+            enviar_tg(f"✅ *RECUPERADO*\n👤 {nombre}\n⏳ Tiempo fuera: {duracion}")
+            del st.session_state.registro_caidas[sn]
 
-    # --- KPI PRINCIPALES ---
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Base Total", len(df))
-    online_df = df[df['status'].str.lower() == 'online']
-    c2.metric("Online ✅", len(online_df))
-    c3.metric("Offline ❌", len(df) - len(online_df), delta_color="inverse")
-    c4.metric("Nuevas 🆕", len(unconfigured) if unconfigured else 0)
+    # --- INTERFAZ ---
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total ONUs", len(df))
+    k2.metric("Online ✅", len(df) - len(df_off))
+    k3.metric("Offline ❌", len(df_off), delta_color="inverse")
+    k4.metric("Nuevas 🆕", len(unconfigured) if unconfigured else 0)
 
     st.markdown("---")
-
-    # --- PESTAÑAS ---
-    t_mon, t_signal, t_hw = st.tabs(["🖥️ Monitor Real-Time", "📡 Análisis Óptico", "🏢 Estado Hardware"])
+    t_mon, t_signal, t_hw = st.tabs(["🖥️ Monitor Principal", "📡 Radar de Señal", "🏢 Salud de OLTs"])
 
     with t_mon:
-        st.subheader("Control de Dispositivos")
-        # Tabla de monitoreo
+        st.subheader("Estado de Clientes en Tiempo Real")
         df['Icon'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
-        cols = ['Icon', 'CLIENTE', 'sn', 'PUERTO', 'status']
-        if modo_avanzado and 'signal' in df.columns: cols.append('signal')
-        
-        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+        st.dataframe(df[['Icon', 'CLIENTE', 'sn', 'PUERTO', 'status', 'last_status_change']], use_container_width=True, hide_index=True)
 
     with t_signal:
-        if modo_avanzado and 'signal' in df.columns:
-            st.subheader("Radar de Potencia Óptica")
-            df['signal_num'] = pd.to_numeric(df['signal'], errors='coerce')
+        if st.session_state.df_avanzado is not None:
+            st.subheader("Análisis Óptico (Último Escaneo)")
+            df_adv = st.session_state.df_avanzado
+            df_adv['signal_num'] = pd.to_numeric(df_adv['signal'], errors='coerce')
             
-            # Gráfica de salud de fibra
-            fig = px.histogram(df, x="signal_num", nbins=25, title="Distribución de Señales dBm", color_discrete_sequence=['#00CC96'])
-            st.plotly_chart(fig, use_container_width=True)
-            
-            criticos = df[df['signal_num'] < -27]
-            st.error(f"Se detectaron {len(criticos)} clientes con señal crítica (Peor a -27dBm)")
-            st.dataframe(criticos[['CLIENTE', 'sn', 'signal', 'PUERTO']], use_container_width=True)
+            # Mostrar solo los que están críticos
+            criticos = df_adv[df_adv['signal_num'] < -27]
+            if not criticos.empty:
+                st.error(f"⚠️ {len(criticos)} clientes con señal crítica")
+                st.dataframe(criticos[['name', 'sn', 'signal', 'status']], use_container_width=True)
+            else:
+                st.success("Toda la red tiene niveles de señal aceptables.")
         else:
-            st.info("ℹ️ La información de señal (dBm) no está disponible en modo básico.")
+            st.info("💡 Haz clic en 'Realizar Escaneo Profundo' en la barra lateral para ver los niveles de señal (dBm).")
 
     with t_hw:
-        st.subheader("Estado de las OLTs")
         if olts:
             for o in olts:
-                st_raw = str(o.get('status')).lower()
-                is_up = st_raw in ['online', 'up', '1', 'active']
-                color = "green" if is_up else "red"
-                st.markdown(f"🏢 **{o.get('name')}** | IP: `{o.get('ip')}` | Estado: :{color}[{st_raw.upper()}]")
+                st_olt = str(o.get('status')).lower()
+                color = "green" if st_olt in ['online', 'up', '1'] else "red"
+                st.markdown(f"🏢 **{o.get('name')}** | IP: `{o.get('ip')}` | Estado: :{color}[{st_olt.upper()}]")
 
 else:
-    st.error("❌ No se pudo obtener ningún tipo de información de la API. Revisa tu Token y la URL.")
+    st.error("❌ Sin conexión a SmartOLT.")
 
 time.sleep(60)
 st.rerun()
