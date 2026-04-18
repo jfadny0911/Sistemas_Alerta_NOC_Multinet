@@ -30,7 +30,7 @@ def enviar_tg(mensaje):
     try: requests.post(url, json=payload, timeout=10)
     except: pass
 
-def llamar_api(endpoint, timeout=25):
+def llamar_api(endpoint, timeout=30):
     url = f"{URL_BASE}/api/{endpoint}"
     headers = {'X-Token': SMART_TOKEN}
     try:
@@ -39,100 +39,78 @@ def llamar_api(endpoint, timeout=25):
         return r.json().get('response') if r.status_code == 200 else None
     except: return None
 
-# --- SIDEBAR: SINCRONIZACIÓN PROFUNDA ---
+# --- SIDEBAR: SINCRONIZACIÓN ---
 with st.sidebar:
-    st.header("⚙️ Herramientas")
+    st.header("⚙️ Panel de Control")
+    st.info("⚠️ Si ves 'No Sincronizado', presiona el botón de abajo.")
     if st.button("♻️ Sincronizar Datos de Clientes"):
-        with st.spinner("Leyendo Name y Address de SmartOLT..."):
-            # Obtenemos TODOS los detalles (incluyendo address_or_comment)
-            data_full = llamar_api("onu/get_all", timeout=60)
+        with st.spinner("Conectando con base de datos maestra..."):
+            # get_all es la única que trae Name y Address or Comment
+            data_full = llamar_api("onu/get_all", timeout=90)
             if data_full:
-                # Guardamos Name, Address y Zona por cada SN
+                # Guardamos todo en memoria usando el SN como llave
                 st.session_state.db_clientes = {
-                    str(r['sn']): {
-                        'name_id': r.get('name', 'N/A'),
-                        'address': r.get('address_or_comment', 'N/A'),
-                        'zona': r.get('zone_name', 'N/A')
+                    str(r['sn']).strip(): {
+                        'name_id': str(r.get('name', 'N/A')),
+                        'address': str(r.get('address_or_comment', 'N/A')),
+                        'zona': str(r.get('zone_name', 'N/A'))
                     } for r in data_full
                 }
-                st.success(f"✅ {len(st.session_state.db_clientes)} Clientes sincronizados.")
-            else: st.error("Error al obtener datos detallados.")
+                st.success(f"✅ {len(st.session_state.db_clientes)} Clientes cargados.")
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error("SmartOLT tardó demasiado en responder. Reintenta.")
 
 # --- PROCESO DE MONITOREO ---
-with st.spinner('Analizando red...'):
-    onus_status = llamar_api("onu/get_onus_statuses")
-    olts = llamar_api("system/get_olts")
+onus_status = llamar_api("onu/get_onus_statuses")
 
 if onus_status is not None:
     df = pd.DataFrame(onus_status)
-    df['sn'] = df['sn'].astype(str)
+    df['sn'] = df['sn'].astype(str).str.strip()
     
-    # 1. MAPEAMOS LOS DATOS DE LA IMAGEN
+    # Función de cruce de datos segura
     def get_info(sn, campo):
         return st.session_state.db_clientes.get(sn, {}).get(campo, "No Sincronizado")
 
     df['NAME_ID'] = df['sn'].apply(lambda x: get_info(x, 'name_id'))
     df['DIRECCION'] = df['sn'].apply(lambda x: get_info(x, 'address'))
-    df['ZONA'] = df['sn'].apply(lambda x: get_info(x, 'zona'))
+    df['ZONA_DETALLE'] = df['sn'].apply(lambda x: get_info(x, 'zona'))
     df['PUERTO'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
     
-    ahora_dt = datetime.now()
     df_off = df[df['status'].str.lower() != 'online'].copy()
 
-    # 2. LÓGICA DE ALERTAS DETALLADAS
-    for _, row in df.iterrows():
-        sn, nombre, address, status = row['sn'], row['NAME_ID'], row['DIRECCION'], str(row['status']).lower()
-        
-        if status != 'online' and sn not in st.session_state.registro_caidas:
-            st.session_state.registro_caidas[sn] = ahora_dt
-            causa = "🔌 Corte de Energía" if "pwfail" in status else "✂️ Corte de Fibra (LOS)"
-            
-            # Mensaje detallado para Telegram como querías
-            msg = f"🔴 *FALLA DE SERVICIO*\n"
-            msg += f"👤 *Cliente:* {address}\n"
-            msg += f"🆔 *Código (Name):* `{nombre}`\n"
-            msg += f"📍 *Zona:* {row['ZONA']}\n"
-            msg += f"🔌 *Puerto:* {row['PUERTO']}\n"
-            msg += f"❓ *Causa:* {causa}"
-            enviar_tg(msg)
-            
-        elif status == 'online' and sn in st.session_state.registro_caidas:
-            inicio = st.session_state.registro_caidas[sn]
-            duracion = str(ahora_dt - inicio).split('.')[0]
-            enviar_tg(f"✅ *RECUPERADO:* {nombre}\n👤 {address}\n⏳ Tiempo fuera: {duracion}")
-            del st.session_state.registro_caidas[sn]
-
-    # --- INTERFAZ VISUAL ---
-    # KPIs Estilo SmartOLT
+    # --- INDICADORES ---
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Clientes Totales", len(df))
     c2.metric("Online ✅", len(df) - len(df_off))
     c3.metric("Offline ❌", len(df_off), delta_color="inverse")
     c4.metric("Fallas de Puerto", len(df_off['PUERTO'].unique()) if not df_off.empty else 0)
 
+    # --- AVISO SI NO HAY SYNC ---
+    if not st.session_state.db_clientes:
+        st.warning("👈 Por favor, abre el menú de la izquierda y pulsa 'Sincronizar Datos' para ver Nombres y Direcciones.")
+
     st.markdown("---")
     
     # BUSCADOR
-    busc = st.text_input("🔍 Buscar cliente por Name (Código), Dirección o SN")
-    df_v = df.copy()
+    busc = st.text_input("🔍 Buscar por Código (Name), Nombre o SN")
     if busc:
-        mask = (df_v['sn'].str.contains(busc, case=False, na=False) | 
-                df_v['NAME_ID'].str.contains(busc, case=False, na=False) |
-                df_v['DIRECCION'].str.contains(busc, case=False, na=False))
-        df_v = df_v[mask]
+        mask = (df['sn'].str.contains(busc, case=False, na=False) | 
+                df['NAME_ID'].str.contains(busc, case=False, na=False) |
+                df['DIRECCION'].str.contains(busc, case=False, na=False))
+        df = df[mask]
 
     # TABLA MAESTRA
     st.subheader("📋 Monitor Maestro de Red")
+    df['Status_Punto'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
     
-    # Función para icono de señal (Simulado según dBm si estuvieran disponibles)
-    df_v['Status_Punto'] = df_v['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
-    
-    # Reordenamos las columnas para que se parezcan a tu imagen
-    cols_final = ['Status_Punto', 'NAME_ID', 'DIRECCION', 'sn', 'ZONA', 'PUERTO', 'status', 'last_status_change']
+    cols_tab = ['Status_Punto', 'NAME_ID', 'DIRECCION', 'sn', 'ZONA_DETALLE', 'PUERTO', 'status', 'last_status_change']
     st.dataframe(
-        df_v[cols_final].rename(columns={
+        df[cols_tab].rename(columns={
             'NAME_ID': 'NAME (Código)', 
-            'DIRECCION': 'Address or Comment', 
+            'DIRECCION': 'Address or Comment',
+            'ZONA_DETALLE': 'ZONA',
             'status': 'Status',
             'last_status_change': 'Since'
         }), 
@@ -140,7 +118,8 @@ if onus_status is not None:
     )
 
 else:
-    st.error("❌ No hay comunicación con SmartOLT.")
+    st.error("❌ Error de conexión con SmartOLT.")
 
+# Auto-refresco
 time.sleep(60)
 st.rerun()
