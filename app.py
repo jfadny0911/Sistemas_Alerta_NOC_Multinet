@@ -74,7 +74,7 @@ if onus is not None:
     
     # Agrupamos por OLT y Puerto para detectar fallas de infraestructura
     fallas_por_puerto = df_off.groupby(['olt_id', 'PUERTO']).size().reset_index(name='cuenta')
-    puertos_masivos = fallas_por_puerto[fallas_por_puerto['cuenta'] >= 3] # Umbral: 3 ONUs
+    puertos_masivos = fallas_por_puerto[fallas_por_puerto['cuenta'] >= 5] # Umbral: 3 ONUs
 
     # --- LÓGICA DE NOTIFICACIÓN INTELIGENTE ---
     # Revisamos cada puerto con falla masiva
