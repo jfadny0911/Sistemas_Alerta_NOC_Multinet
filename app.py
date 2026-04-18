@@ -4,35 +4,31 @@ import requests
 import time
 from datetime import datetime
 
-# --- CONFIGURACIÓN DE PÁGINA ---
+# --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Multinet NOC - Ultra Intelligence", page_icon="📡", layout="wide")
 
-# 1. Carga de Credenciales Segura
+# 1. Carga de Credenciales
 try:
     URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
     SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
-    TG_TOKEN = st.secrets["telegram"]["token"] # Tu secreto dice 'token'
+    TG_TOKEN = st.secrets["telegram"]["token"]
     TG_CHAT = st.secrets["telegram"]["chat_id"]
 except Exception as e:
-    st.error(f"❌ Error crítico en Secrets: Falta la llave {e}")
+    st.error(f"❌ Error en Secrets: {e}")
     st.stop()
 
-# --- MEMORIA DE ESTADO ---
-if 'ultimo_estado_red' not in st.session_state:
-    st.session_state.ultimo_estado_red = ""
+# --- MEMORIA ---
+if 'ultimo_hash_fallas' not in st.session_state:
+    st.session_state.ultimo_hash_fallas = ""
 
-st.title("🛰️ Multinet NOC: Centro de Mando Pro")
+st.title("🛰️ Multinet NOC: Centro de Control")
 
-# --- FUNCIONES NÚCLEO ---
+# --- FUNCIONES CORE ---
 def enviar_tg(mensaje):
-    """Envía mensaje a Telegram y devuelve si fue exitoso"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT, "text": mensaje, "parse_mode": "Markdown"}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.status_code == 200, r.text
-    except Exception as e:
-        return False, str(e)
+    try: requests.post(url, json=payload, timeout=10)
+    except: pass
 
 def llamar_api(endpoint):
     url = f"{URL_BASE}/api/{endpoint}"
@@ -43,108 +39,101 @@ def llamar_api(endpoint):
         return r.json().get('response') if r.status_code == 200 else None
     except: return None
 
-# --- BARRA LATERAL: HERRAMIENTAS DE PRUEBA ---
-with st.sidebar:
-    st.header("🛠️ Herramientas")
-    if st.button("🔌 Probar Conexión Telegram"):
-        success, response = enviar_tg("🔔 *Prueba de Conexión:* El Bot de Multinet está vinculado correctamente.")
-        if success: st.success("¡Mensaje enviado!")
-        else: st.error(f"Error: {response}")
-
-# --- PROCESO DE DATOS ---
-with st.spinner('Analizando red en tiempo real...'):
+# --- OBTENCIÓN DE DATOS ---
+with st.spinner('Sincronizando con SmartOLT...'):
     onus = llamar_api("onu/get_onus_statuses")
+    olts = llamar_api("system/get_olts")
+    unconfigured = llamar_api("onu/get_unconfigured")
     zonas = llamar_api("system/get_zones")
 
 if onus is not None:
     df = pd.DataFrame(onus)
-    
-    # Unir con nombres de zonas
-    if zonas:
-        df_z = pd.DataFrame(zonas)
-        df_z['id'] = df_z['id'].astype(str)
-        df['zone_id'] = df['zone_id'].astype(str)
-        df = pd.merge(df, df_z[['id', 'name']], left_on='zone_id', right_on='id', how='left')
-    
-    df['Puerto'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
+    # Preparar datos de clientes
     df['NAME_ID'] = df['onu'].fillna(df['sn'])
-    df['Zona_Txt'] = df['name'].fillna("Sin Zona")
+    df['PUERTO'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
     
-    # Filtro de caídos
+    # --- PROCESAMIENTO DE FALLAS PARA TELEGRAM ---
     df_off = df[df['status'].str.lower() != 'online'].copy()
-    
-    # Lógica de Notificación: Comparamos si el set de SN caídos cambió
-    hash_fallas = "-".join(sorted(df_off['sn'].astype(str).tolist()))
-    
-    if hash_fallas != st.session_state.ultimo_estado_red:
-        if not df_off.empty:
-            # CONSTRUCCIÓN DEL REPORTE EXTENSO
-            fecha_act = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-            msg = f"🚨 *REPORTE DE INCIDENCIAS MULTINET*\n"
-            msg += f"📅 _Sincronización: {fecha_act}_\n"
-            msg += "------------------------------------------\n\n"
-            
-            # Agrupar por OLT
-            for olt in df_off['olt_id'].unique():
-                df_olt = df_off[df_off['olt_id'] == olt]
-                msg += f"🏢 *OLT:* {olt}\n"
-                
-                # Agrupar por Puerto dentro de la OLT
-                for p in df_olt['Puerto'].unique():
-                    df_p = df_olt[df_olt['Puerto'] == p]
-                    nombres = ", ".join(df_p['NAME_ID'].astype(str).tolist())
-                    msg += f"  🔌 *Puerto:* {p} 📉 *Caídos:* ({len(df_p)})\n"
-                    msg += f"  👥 _Clientes:_ {nombres}\n"
-                msg += "\n"
-            
-            msg += "------------------------------------------\n"
-            msg += f"📊 *Resumen:* {len(df_off)} clientes fuera de servicio."
-            
-            # Enviar y guardar estado
-            enviar_tg(msg)
-            st.session_state.ultimo_estado_red = hash_fallas
-        else:
-            # Si se recuperaron todos
-            if st.session_state.ultimo_estado_red != "":
-                enviar_tg("✅ *RED ESTABLE:* Todos los servicios se han restablecido.")
-                st.session_state.ultimo_estado_red = ""
+    hash_actual = "-".join(sorted(df_off['sn'].astype(str).tolist()))
 
-    # --- INTERFAZ DEL DASHBOARD (TODA LA INFO) ---
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Base Total", len(df))
+    if hash_actual != st.session_state.ultimo_hash_fallas:
+        if not df_off.empty:
+            ahora = datetime.now().strftime('%d/%m/%Y %H:%M')
+            reporte = f"🚨 *REPORTE DE INCIDENCIAS MULTINET*\n📅 _{ahora}_\n"
+            reporte += "------------------------------------------\n\n"
+            
+            for olt_id in df_off['olt_id'].unique():
+                # Intentamos buscar el nombre de la OLT si está en la lista de OLTS
+                nombre_olt = olt_id
+                if olts:
+                    for o in olts:
+                        if str(o.get('id')) == str(olt_id):
+                            nombre_olt = o.get('name')
+                
+                reporte += f"🏢 *OLT:* {nombre_olt}\n"
+                df_olt = df_off[df_off['olt_id'] == olt_id]
+                
+                for p in df_olt['PUERTO'].unique():
+                    df_p = df_olt[df_olt['PUERTO'] == p]
+                    nombres = ", ".join(df_p['NAME_ID'].astype(str).tolist())
+                    reporte += f"  🔌 *Puerto:* {p} ({len(df_p)} caídos)\n"
+                    reporte += f"  👤 _Clientes:_ {nombres}\n"
+                reporte += "\n"
+            
+            reporte += "------------------------------------------\n"
+            reporte += f"📉 *TOTAL OFFLINE:* {len(df_off)}"
+            enviar_tg(reporte)
+        st.session_state.ultimo_hash_fallas = hash_actual
+
+    # --- INTERFAZ ---
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total ONUs", len(df))
     k2.metric("Online ✅", len(df[df['status'].str.lower() == 'online']))
-    k3.metric("Fallas 🚨", len(df_off), delta_color="inverse")
+    k3.metric("Offline 🚨", len(df_off), delta_color="inverse")
+    k4.metric("Por Autorizar 🆕", len(unconfigured) if unconfigured else 0)
 
     st.markdown("---")
-    
-    tab_mon, tab_nuevas = st.tabs(["🖥️ Monitor General", "🆕 ONUs por Autorizar"])
-    
-    with tab_mon:
-        # Buscador
-        busc = st.text_input("🔍 Buscar por SN o Name", "")
-        df_show = df.copy()
-        if busc:
-            df_show = df_show[df_show['sn'].str.contains(busc, case=False) | df_show['NAME_ID'].str.contains(busc, case=False)]
-        
-        df_show['Icon'] = df_show['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
-        st.dataframe(
-            df_show[['Icon', 'NAME_ID', 'sn', 'Zona_Txt', 'Puerto', 'status', 'last_status_change']].rename(
-                columns={'NAME_ID': 'NAME (Código)', 'sn': 'Serie SN', 'status': 'Estado'}
-            ),
-            use_container_width=True, hide_index=True
-        )
 
-    with tab_nuevas:
-        unconf = llamar_api("onu/get_unconfigured")
-        if unconf:
-            st.success(f"Hay {len(unconf)} ONUs nuevas detectadas.")
-            st.dataframe(pd.DataFrame(unconf), use_container_width=True)
+    t1, t2, t3 = st.tabs(["🖥️ Monitor de Clientes", "🆕 Por Autorizar", "🏢 Estado de OLTS"])
+
+    with t1:
+        st.subheader("📋 Lista de Clientes (Base Completa)")
+        df['Icono'] = df['status'].apply(lambda x: "🟢" if str(x).lower() == 'online' else "🔴")
+        st.dataframe(df[['Icono', 'NAME_ID', 'sn', 'PUERTO', 'status', 'last_status_change']], use_container_width=True, hide_index=True)
+
+    with t2:
+        st.subheader("🆕 Equipos detectados sin configurar")
+        if unconfigured:
+            st.success(f"Se encontraron {len(unconfigured)} ONUs esperando.")
+            st.dataframe(pd.DataFrame(unconfigured), use_container_width=True)
         else:
-            st.write("No hay equipos pendientes.")
+            st.info("No hay equipos pendientes de autorización.")
+
+    with t3:
+        st.subheader("🏢 Estado del Hardware (OLTs)")
+        if olts:
+            for o in olts:
+                # Lógica de estado ultra-robusta
+                st_raw = str(o.get('status', '')).lower()
+                # Consideramos online si es 'online', '1', 'up', 'active', etc.
+                is_online = st_raw in ['online', '1', 'true', 'up', 'active', 'enabled']
+                
+                nombre = o.get('name', 'OLT Desconocida')
+                ip = o.get('ip', 'N/A')
+                status_txt = "ONLINE" if is_online else f"OFFLINE ({st_raw})"
+                color = "green" if is_online else "red"
+                
+                st.markdown(f"🖥️ **{nombre}** | IP: `{ip}` | Estado: :{color}[{status_txt}]")
+                # Botón de ayuda para debug si siguen saliendo offline
+                if not is_online:
+                    with st.expander(f"Ver datos crudos de {nombre}"):
+                        st.json(o)
+        else:
+            st.warning("No se recibió información de las OLTs. Verifica los permisos de tu API Key.")
 
 else:
-    st.error("❌ No se pudo conectar con la API de SmartOLT.")
+    st.error("❌ No se pudo conectar con SmartOLT.")
 
-# Auto-refresco cada 60 segundos
+# Auto-refresco
 time.sleep(60)
 st.rerun()
