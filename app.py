@@ -459,15 +459,40 @@ if tx_field:
 # ── Zona — SmartOLT campo 'zone_name' ────────────────────────
 zone_col = next((c for c in df.columns if c.lower() in ('zone_name', 'zone', 'zona')), None)
 
-# ── Enriquecer con db_clientes (sync por bloques) ─────────────
-# db_clientes[sn] = {name, address_or_comment, zona}
-# Campos reales SmartOLT: name="2014236", address_or_comment="150MB//LOURDES..."
-df['_name']    = df['_sn'].map(lambda s: db_clientes.get(s, {}).get('name', ''))
-df['_address'] = df['_sn'].map(lambda s: db_clientes.get(s, {}).get('address_or_comment', ''))
-# Zona: preferir db_clientes, fallback al campo directo de la API
-df['_zona']    = df['_sn'].map(lambda s: db_clientes.get(s, {}).get('zona', ''))
+# ── Campos que vienen DIRECTO de get_onus_statuses ───────────
+# Según imagen real: name (código cliente), address_or_comment, zone_name
+# Estos campos ya están en el response sin necesidad de sync
+name_col    = next((c for c in df.columns if c.lower() == 'name'), None)
+address_col = next((c for c in df.columns if c.lower() in
+                    ('address_or_comment', 'address', 'comment')), None)
+
+# ── Enriquecer: API directa primero, luego db_clientes como complemento ──
+# Prioridad: campo directo API > db_clientes > SN como fallback
+df['_name'] = ''
+if name_col:
+    df['_name'] = df[name_col].fillna('').astype(str)
+# Complementar con db_clientes si el campo directo está vacío
+df['_name'] = df.apply(
+    lambda r: r['_name'] or db_clientes.get(r['_sn'], {}).get('name', ''),
+    axis=1
+)
+
+df['_address'] = ''
+if address_col:
+    df['_address'] = df[address_col].fillna('').astype(str)
+df['_address'] = df.apply(
+    lambda r: r['_address'] or db_clientes.get(r['_sn'], {}).get('address_or_comment', ''),
+    axis=1
+)
+
+# Zona: campo directo API > db_clientes
+df['_zona'] = ''
 if zone_col:
-    df['_zona'] = df['_zona'].where(df['_zona'] != '', df[zone_col].fillna(''))
+    df['_zona'] = df[zone_col].fillna('').astype(str)
+df['_zona'] = df.apply(
+    lambda r: r['_zona'] or db_clientes.get(r['_sn'], {}).get('zona', ''),
+    axis=1
+)
 
 # ── Nombre de OLT ─────────────────────────────────────────────
 # SmartOLT devuelve olt_id numérico, olt_map lo convierte a "2 - El Rosario"
@@ -543,6 +568,16 @@ if slas_recuperados:
 # ══════════════════════════════════════════════════════════════
 st.subheader("🖥️ SmartView — Estado de Red")
 
+# Aviso de sincronización pendiente
+if len(db_clientes) == 0:
+    st.warning(
+        "⚠️ **Sincronización pendiente** — Los campos *Código* y *Dirección* "
+        "muestran el SN hasta que hagas clic en **🔄 Sincronizar (OLT por OLT)** "
+        "en el panel izquierdo. Solo se hace una vez y tarda ~1 min para 4,300 clientes."
+    )
+else:
+    st.caption(f"✅ {len(db_clientes):,} clientes en caché — Código y Dirección disponibles")
+
 # Buscador
 buscar = st.text_input("🔍 Buscar por nombre, SN, dirección o zona...", "")
 
@@ -577,34 +612,43 @@ def build_smartview(df_src: pd.DataFrame, solo_offline: bool = False) -> pd.Data
             # Online: mostrar cuánto tiempo lleva online si API da timestamp
             since = '✅'
 
-        # ── Nombre / Código de cliente ────────
-        # SmartOLT: name = "2014236"
-        nombre = str(row.get('_name') or row.get('name', '') or sn)
+        # ── Código de cliente (campo 'name' en SmartOLT = "2014236") ──
+        codigo = str(row.get('_name', '') or '').strip()
+        if not codigo:
+            codigo = sn  # fallback al SN si no hay sync
 
-        # ── Dirección / Comentario ────────────
+        # ── Dirección / Comentario ────────────────────────────────
         # SmartOLT: "150MB//LOURDES DE MARIA CASTILLO DE SANTOS&&RES&&24494"
-        address = str(row.get('_address') or row.get('address_or_comment', ''))
+        # Viene directo de get_onus_statuses en campo 'address_or_comment'
+        address = str(row.get('_address', '') or '').strip()
 
-        # ── Puerto — formato Board/Port ───────
-        # Derivado de "gpon-onu_0/5/8:6" → "B5/P8"
-        puerto = str(row.get('_puerto_full') or row.get('pon_port', '—'))
+        # ── Puerto — "gpon-onu_0/5/8:6" → "B5/P8:6" ─────────────
+        puerto = str(row.get('_puerto_full', '') or '').strip()
+        if not puerto or puerto == '—':
+            # Fallback: buscar campo pon_port directo
+            puerto = str(row.get('pon_port', row.get('port', '—')) or '—')
 
-        # ── Señal RX ──────────────────────────
+        # ── Señal RX ──────────────────────────────────────────────
         rx_val = ''
-        if rx_field and pd.notna(row.get(rx_field)):
-            rx_val = f"{float(row[rx_field]):.2f} dBm"
+        if rx_field:
+            v = row.get(rx_field)
+            try:
+                if v is not None and str(v) not in ('', 'nan', 'None'):
+                    rx_val = f"{float(v):.2f} dBm"
+            except (ValueError, TypeError):
+                pass
 
-        # ── ONU type ─────────────────────────
-        onu_type = str(db_clientes.get(sn, {}).get('onu_type', '') or
-                       row.get('onu_type', ''))
+        # ── ONU Type (ej: "GM630") ────────────────────────────────
+        onu_type = str(row.get('onu_type', '') or
+                       db_clientes.get(sn, {}).get('onu_type', '')).strip()
 
         rows.append({
             'St':        icon,
-            'Nombre':    nombre,
+            'Código':    codigo,       # name = "2014236"
             'Dirección / Comentario': address,
             'SN':        sn,
-            'Zona':      str(row.get('_zona') or row.get('zone_name', '')),
-            'OLT':       str(row.get('_olt_name', '')),
+            'Zona':      str(row.get('_zona', '') or '').strip(),
+            'OLT':       str(row.get('_olt_name', '') or '').strip(),
             'Puerto':    puerto,
             'ONU Type':  onu_type,
             'RX Signal': rx_val,
@@ -620,7 +664,7 @@ with tab1:
     df_view_off = build_smartview(df, solo_offline=True)
     if buscar:
         mask = (
-            df_view_off['Nombre'].str.contains(buscar, case=False, na=False) |
+            df_view_off['Código'].str.contains(buscar, case=False, na=False) |
             df_view_off['SN'].str.contains(buscar, case=False, na=False) |
             df_view_off['Dirección / Comentario'].str.contains(buscar, case=False, na=False) |
             df_view_off['Zona'].str.contains(buscar, case=False, na=False)
@@ -636,7 +680,7 @@ with tab2:
     df_view_all = build_smartview(df, solo_offline=False)
     if buscar:
         mask = (
-            df_view_all['Nombre'].str.contains(buscar, case=False, na=False) |
+            df_view_all['Código'].str.contains(buscar, case=False, na=False) |
             df_view_all['SN'].str.contains(buscar, case=False, na=False) |
             df_view_all['Dirección / Comentario'].str.contains(buscar, case=False, na=False) |
             df_view_all['Zona'].str.contains(buscar, case=False, na=False)
