@@ -101,7 +101,7 @@ def api_get(endpoint: str, params: dict = None):
 def sincronizar_clientes(olts: list, progress_bar=None):
     """
     Consulta onu/get_all filtrando por olt_id para evitar timeouts.
-    Llena db_clientes: {sn: {name, address_or_comment, zona}}.
+    Campos reales SmartOLT: name, address_or_comment, zone_name, sn.
     """
     total = len(olts)
     for i, olt in enumerate(olts):
@@ -112,24 +112,33 @@ def sincronizar_clientes(olts: list, progress_bar=None):
             resp = api_get("onu/get_all", params={'olt_id': olt_id})
             if resp and isinstance(resp, list):
                 for onu in resp:
-                    sn = onu.get('sn') or onu.get('serial_number', '')
-                    if sn:
-                        db_clientes[sn] = {
-                            'name':               onu.get('name', ''),
-                            'address_or_comment': onu.get('address_or_comment',
-                                                  onu.get('comment', '')),
-                            'zona':               onu.get('zone_name',
-                                                  onu.get('zona', '')),
-                        }
+                    # SN real: "ZXICC5707236"
+                    sn = str(onu.get('sn', onu.get('serial_number', ''))).strip()
+                    if not sn:
+                        continue
+                    # name real: "2014236" (código de cliente)
+                    # address_or_comment real: "150MB//LOURDES DE MARIA CASTILLO..."
+                    # zone_name real: "Tilapa"
+                    db_clientes[sn] = {
+                        'name':               str(onu.get('name', '')).strip(),
+                        'address_or_comment': str(onu.get('address_or_comment',
+                                                  onu.get('comment', ''))).strip(),
+                        'zona':               str(onu.get('zone_name',
+                                                  onu.get('zone', ''))).strip(),
+                        'olt_id':             str(olt_id),
+                        'onu_type':           str(onu.get('onu_type', '')).strip(),
+                    }
         except Exception:
             pass
 
         if progress_bar:
-            progress_bar.progress((i + 1) / total,
-                                  text=f"Sincronizando OLT {i+1}/{total}: {olt.get('name','')}")
+            progress_bar.progress(
+                (i + 1) / total,
+                text=f"Sincronizando {i+1}/{total}: {olt.get('name', f'OLT {olt_id}')}"
+            )
 
-    st.session_state['db_clientes']  = db_clientes
-    st.session_state['ultima_sync']  = time.time()
+    st.session_state['db_clientes'] = db_clientes
+    st.session_state['ultima_sync'] = time.time()
 
 # ══════════════════════════════════════════════════════════════
 # TELEGRAM
@@ -169,17 +178,28 @@ def tiempo_restante(key: str) -> str:
 # LÓGICA DE CAÍDAS — SLA y CAUSA
 # ══════════════════════════════════════════════════════════════
 def detectar_causa(row: dict) -> str:
-    """Devuelve emoji + label según causa de caída."""
-    status = str(row.get('status', '')).lower().replace(' ', '_')
-    cause  = str(row.get('cause',  row.get('last_event', ''))).lower().replace(' ', '_')
-    combined = status + ' ' + cause
-    for c in CAUSAS_LOS:
-        if c in combined:
-            return '🔴 LOS (Fibra)'
-    for c in CAUSAS_PWFAIL:
-        if c in combined:
-            return '⚡ PwFail (Energía)'
-    return '❓ Offline'
+    """
+    Detecta causa basándose en los statuses reales de SmartOLT:
+    'Online', 'Offline', 'LOS', 'Power fail', 'Dying Gasp'
+    """
+    status = str(row.get('status', '')).strip()
+    status_l = status.lower().replace(' ', '_').replace('-', '_')
+
+    # LOS = corte de fibra
+    if status_l in ('los', 'fiber_cut', 'fibercut', 'los_signal') or 'los' in status_l:
+        return '🔴 LOS (Corte de fibra)'
+
+    # Power fail / Dying Gasp = corte de energía o desconexión manual
+    if status_l in ('power_fail', 'pwfail', 'dying_gasp', 'dyinggasp') or \
+       'power' in status_l or 'dying' in status_l:
+        return '⚡ PwFail (Corte de energía)'
+
+    # Offline genérico
+    if status_l in ('offline', 'unreachable', 'down'):
+        return '🟠 Offline'
+
+    # Cualquier otro estado no-online
+    return f'🟠 {status}' if status else '🟠 Offline'
 
 def formato_duracion(segundos: float) -> str:
     s = int(segundos)
@@ -219,21 +239,27 @@ def actualizar_registro_caidas(df_offline: pd.DataFrame, df_online_sn: set):
 # ══════════════════════════════════════════════════════════════
 def detectar_fallas_masivas(df_offline: pd.DataFrame) -> list:
     """
+    Agrupa por olt_id + _port (extraído del formato gpon-onu_0/BOARD/PORT:ID).
     Retorna lista de puertos con falla masiva nueva (>= FALLA_MASIVA_MIN).
     """
     nuevas = []
-    if 'olt_id' not in df_offline.columns or 'pon_port' not in df_offline.columns:
+
+    # Usar _port si existe (parseado de gpon-onu_0/5/8:6), sino pon_port
+    port_col = '_port' if '_port' in df_offline.columns else \
+               ('pon_port' if 'pon_port' in df_offline.columns else None)
+
+    if 'olt_id' not in df_offline.columns or port_col is None:
         return nuevas
 
-    grupos = df_offline.groupby(['olt_id', 'pon_port'])
-    for (olt_id, pon_port), grupo in grupos:
-        key = f"{olt_id}_{pon_port}"
+    grupos = df_offline.groupby(['olt_id', port_col])
+    for (olt_id, port), grupo in grupos:
+        key = f"{olt_id}_{port}"
         if len(grupo) >= FALLA_MASIVA_MIN and key not in alertas_masivas:
             nuevas.append({
                 'olt_id':   olt_id,
-                'pon_port': pon_port,
+                'pon_port': port,
                 'count':    len(grupo),
-                'sns':      list(grupo.get('sn', grupo.get('serial_number', pd.Series())).head(5)),
+                'sns':      list(grupo['_sn'].head(5)) if '_sn' in grupo.columns else [],
                 'key':      key,
             })
     return nuevas
@@ -330,36 +356,94 @@ if not raw_status or not isinstance(raw_status, list):
 # ══════════════════════════════════════════════════════════════
 df = pd.DataFrame(raw_status)
 
-# Normalizar columnas clave
-df['status_lower'] = df['status'].fillna('').str.lower()
-df['es_offline']   = (df['status_lower'] != 'online').astype(int)
-
-# SN normalizado
-sn_col = 'sn' if 'sn' in df.columns else ('serial_number' if 'serial_number' in df.columns else None)
-if sn_col:
-    df['_sn'] = df[sn_col].fillna('').astype(str)
+# ── Normalizar status ─────────────────────────────────────────
+# SmartOLT devuelve: "Online", "Offline", "LOS", "Power fail", "Dying Gasp"
+status_col = next((c for c in df.columns if c.lower() == 'status'), None)
+if status_col:
+    df['status_lower'] = df[status_col].fillna('').str.lower().str.strip()
 else:
-    df['_sn'] = ''
+    df['status_lower'] = ''
+df['es_offline'] = (df['status_lower'] != 'online').astype(int)
 
-# Enriquecer con db_clientes
+# ── SN — SmartOLT usa campo 'sn' ──────────────────────────────
+# Ejemplo real: "ZXICC5707236"
+sn_col = next((c for c in df.columns if c.lower() == 'sn'), None) or \
+         next((c for c in df.columns if 'serial' in c.lower()), None)
+df['_sn'] = df[sn_col].fillna('').astype(str) if sn_col else ''
+
+# ── ONU identifier — "gpon-onu_0/5/8:6" → board/port extraído ─
+# SmartOLT puede devolver campo 'onu' o 'onu_id' con formato gpon-onu_0/BOARD/PORT:ID
+onu_id_col = next((c for c in df.columns if c.lower() in ('onu', 'onu_id', 'onu_name')), None)
+
+def parse_onu_port(onu_str: str) -> dict:
+    """Extrae board, port, id del formato gpon-onu_0/5/8:6"""
+    try:
+        parts = str(onu_str).split('/')
+        if len(parts) >= 3:
+            board = parts[-2]
+            port_id = parts[-1].split(':')
+            port = port_id[0]
+            onu_seq = port_id[1] if len(port_id) > 1 else ''
+            return {'board': board, 'port': port, 'onu_seq': onu_seq}
+    except Exception:
+        pass
+    return {'board': '', 'port': '', 'onu_seq': ''}
+
+if onu_id_col:
+    parsed = df[onu_id_col].fillna('').apply(parse_onu_port).apply(pd.Series)
+    df['_board']   = parsed['board']
+    df['_port']    = parsed['port']
+    df['_onu_seq'] = parsed['onu_seq']
+    # Puerto legible: "Board 5 / Port 8"
+    df['_puerto_full'] = df.apply(
+        lambda r: f"B{r['_board']}/P{r['_port']}" if r['_board'] else str(r.get('pon_port', '—')),
+        axis=1
+    )
+else:
+    df['_board']       = ''
+    df['_port']        = df.get('pon_port', pd.Series(['—'] * len(df))).fillna('—').astype(str)
+    df['_puerto_full'] = df['_port']
+
+# ── Señal RX/TX — SmartOLT devuelve "ONU/OLT Rx signal" ───────
+# Campos posibles en API: 'rx_power', 'olt_rx_signal', 'signal', 'rx'
+# El formato en pantalla: "-21.24 dBm / -26.03 dBm (3183m)"
+rx_field = next((c for c in df.columns if c.lower() in
+    ('rx_power', 'olt_rx_signal', 'signal_rx', 'rx', 'signal',
+     'onu_rx_signal', 'rx_signal')), None)
+tx_field = next((c for c in df.columns if c.lower() in
+    ('tx_power', 'olt_tx_signal', 'signal_tx', 'tx')), None)
+
+if rx_field:
+    # Limpiar posibles strings como "-21.24 dBm"
+    df[rx_field] = df[rx_field].astype(str).str.extract(r'(-?\d+\.?\d*)')[0]
+    df[rx_field] = pd.to_numeric(df[rx_field], errors='coerce')
+if tx_field:
+    df[tx_field] = df[tx_field].astype(str).str.extract(r'(-?\d+\.?\d*)')[0]
+    df[tx_field] = pd.to_numeric(df[tx_field], errors='coerce')
+
+# ── Zona — SmartOLT campo 'zone_name' ────────────────────────
+zone_col = next((c for c in df.columns if c.lower() in ('zone_name', 'zone', 'zona')), None)
+
+# ── Enriquecer con db_clientes (sync por bloques) ─────────────
+# db_clientes[sn] = {name, address_or_comment, zona}
+# Campos reales SmartOLT: name="2014236", address_or_comment="150MB//LOURDES..."
 df['_name']    = df['_sn'].map(lambda s: db_clientes.get(s, {}).get('name', ''))
 df['_address'] = df['_sn'].map(lambda s: db_clientes.get(s, {}).get('address_or_comment', ''))
+# Zona: preferir db_clientes, fallback al campo directo de la API
 df['_zona']    = df['_sn'].map(lambda s: db_clientes.get(s, {}).get('zona', ''))
+if zone_col:
+    df['_zona'] = df['_zona'].where(df['_zona'] != '', df[zone_col].fillna(''))
 
-# Nombre de OLT
+# ── Nombre de OLT ─────────────────────────────────────────────
+# SmartOLT devuelve olt_id numérico, olt_map lo convierte a "2 - El Rosario"
 if 'olt_id' in df.columns:
     df['_olt_name'] = df['olt_id'].astype(str).map(olt_map).fillna('?')
 else:
     df['_olt_name'] = '?'
 
-# Causa de caída
+# ── Causa de caída ────────────────────────────────────────────
+# Statuses reales SmartOLT: "LOS", "Power fail", "Dying Gasp", "Offline"
 df['_causa'] = df.apply(lambda r: detectar_causa(r.to_dict()) if r['es_offline'] else '', axis=1)
-
-# Señal RX
-rx_field = next((c for c in df.columns if c.lower() in
-                 ('rx_power','rx','signal_rx','downstream','signal')), None)
-if rx_field:
-    df[rx_field] = pd.to_numeric(df[rx_field], errors='coerce')
 
 # ── Separar online / offline ─────────────────────────────────
 df_offline = df[df['es_offline'] == 1].copy()
@@ -427,19 +511,18 @@ st.subheader("🖥️ SmartView — Estado de Red")
 # Buscador
 buscar = st.text_input("🔍 Buscar por nombre, SN, dirección o zona...", "")
 
-# Construir tabla SmartView
+# Construir tabla SmartView — columnas clonadas de SmartOLT
 def build_smartview(df_src: pd.DataFrame, solo_offline: bool = False) -> pd.DataFrame:
     ahora = time.time()
     rows  = []
     src   = df_src[df_src['es_offline'] == 1] if solo_offline else df_src
 
     for _, row in src.iterrows():
-        sn        = row.get('_sn', '')
-        status    = row.get('status_lower', '')
-        es_off    = row.get('es_offline', 0)
-        causa     = row.get('_causa', '')
+        sn     = str(row.get('_sn', ''))
+        es_off = int(row.get('es_offline', 0))
+        causa  = str(row.get('_causa', ''))
 
-        # Ícono de estado
+        # ── Ícono de estado (clona SmartOLT) ──
         if not es_off:
             icon = '🟢'
         elif 'los' in causa.lower() or 'fibra' in causa.lower():
@@ -449,23 +532,49 @@ def build_smartview(df_src: pd.DataFrame, solo_offline: bool = False) -> pd.Data
         else:
             icon = '🟠'
 
-        # Since (tiempo caído)
-        inicio   = registro_caidas.get(sn)
-        since    = formato_duracion(ahora - inicio) if inicio else ('—' if es_off else 'Online')
+        # ── Since — tiempo caído ──────────────
+        inicio = registro_caidas.get(sn)
+        if inicio:
+            since = formato_duracion(ahora - inicio)
+        elif es_off:
+            since = '—'
+        else:
+            # Online: mostrar cuánto tiempo lleva online si API da timestamp
+            since = '✅'
 
-        # Puerto
-        pon_port = row.get('pon_port', row.get('port', '—'))
+        # ── Nombre / Código de cliente ────────
+        # SmartOLT: name = "2014236"
+        nombre = str(row.get('_name') or row.get('name', '') or sn)
+
+        # ── Dirección / Comentario ────────────
+        # SmartOLT: "150MB//LOURDES DE MARIA CASTILLO DE SANTOS&&RES&&24494"
+        address = str(row.get('_address') or row.get('address_or_comment', ''))
+
+        # ── Puerto — formato Board/Port ───────
+        # Derivado de "gpon-onu_0/5/8:6" → "B5/P8"
+        puerto = str(row.get('_puerto_full') or row.get('pon_port', '—'))
+
+        # ── Señal RX ──────────────────────────
+        rx_val = ''
+        if rx_field and pd.notna(row.get(rx_field)):
+            rx_val = f"{float(row[rx_field]):.2f} dBm"
+
+        # ── ONU type ─────────────────────────
+        onu_type = str(db_clientes.get(sn, {}).get('onu_type', '') or
+                       row.get('onu_type', ''))
 
         rows.append({
-            'St':      icon,
-            'Nombre':  row.get('_name') or row.get('name', sn),
-            'Dirección / Comentario': row.get('_address', ''),
-            'SN':      sn,
-            'Zona':    row.get('_zona') or row.get('zone_name', ''),
-            'OLT':     row.get('_olt_name', ''),
-            'Puerto':  pon_port,
-            'Status':  causa if es_off else '✅ Online',
-            'Since':   since,
+            'St':        icon,
+            'Nombre':    nombre,
+            'Dirección / Comentario': address,
+            'SN':        sn,
+            'Zona':      str(row.get('_zona') or row.get('zone_name', '')),
+            'OLT':       str(row.get('_olt_name', '')),
+            'Puerto':    puerto,
+            'ONU Type':  onu_type,
+            'RX Signal': rx_val,
+            'Status':    causa if es_off else '✅ Online',
+            'Since':     since,
         })
 
     return pd.DataFrame(rows)
@@ -516,25 +625,41 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════════
 st.subheader("📊 Señal por Puerto PON / OLT")
 
-group_cols = [c for c in ['olt_id', 'pon_port'] if c in df.columns]
+# Usar _port (parseado de gpon-onu_0/BOARD/PORT:ID) o pon_port como fallback
+port_grp = '_port' if '_port' in df.columns else \
+           ('pon_port' if 'pon_port' in df.columns else None)
+group_cols = [c for c in ['olt_id', port_grp] if c and c in df.columns]
+
 if group_cols:
-    agg       = {'es_offline': 'sum', '_sn': 'count'}
-    ren       = {'_sn': 'total_onus', 'es_offline': 'offline'}
+    agg = {'es_offline': 'sum', '_sn': 'count'}
+    ren = {'_sn': 'total_onus', 'es_offline': 'offline'}
     if rx_field:
-        agg[rx_field]       = 'mean'
-        ren[rx_field]       = 'rx_prom_dBm'
+        agg[rx_field] = 'mean'
+        ren[rx_field] = 'rx_prom_dBm'
+    if tx_field:
+        agg[tx_field] = 'mean'
+        ren[tx_field] = 'tx_prom_dBm'
 
     df_port = df.groupby(group_cols).agg(agg).rename(columns=ren).reset_index()
     if 'olt_id' in df_port.columns:
         df_port['OLT'] = df_port['olt_id'].astype(str).map(olt_map).fillna('?')
+    if port_grp in df_port.columns:
+        df_port = df_port.rename(columns={port_grp: 'Puerto'})
 
     for olt_id in (df_port['olt_id'].unique() if 'olt_id' in df_port.columns else []):
         nombre = olt_map.get(str(olt_id), f"OLT {olt_id}")
         sub    = df_port[df_port['olt_id'] == olt_id].drop(columns=['olt_id', 'OLT'], errors='ignore')
+        # Highlight filas con alto offline
         with st.expander(f"🖥️ {nombre}", expanded=False):
             st.dataframe(sub, use_container_width=True, hide_index=True)
-else:
-    st.info("Sin campos olt_id / pon_port disponibles para agrupar.")
+            total_p = int(sub['total_onus'].sum())
+            off_p   = int(sub['offline'].sum())
+            rx_p    = sub['rx_prom_dBm'].mean() if 'rx_prom_dBm' in sub.columns else None
+            m1, m2, m3 = st.columns(3)
+            m1.metric("ONUs", total_p)
+            m2.metric("Offline", off_p)
+            if rx_p is not None:
+                m3.metric("RX prom", f"{rx_p:.2f} dBm")
 
 st.markdown("---")
 
