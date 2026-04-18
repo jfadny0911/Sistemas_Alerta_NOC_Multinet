@@ -5,9 +5,9 @@ import time
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Multinet NOC - SLA Monitor", page_icon="⏱️", layout="wide")
+st.set_page_config(page_title="Multinet NOC - Inteligencia Artificial", page_icon="🧠", layout="wide")
 
-# 1. Credenciales
+# Credenciales
 try:
     URL_BASE = st.secrets["smartolt"]["url"].strip().rstrip('/')
     SMART_TOKEN = st.secrets["smartolt"]["token"].strip()
@@ -17,14 +17,15 @@ except Exception as e:
     st.error(f"❌ Error en Secrets: {e}")
     st.stop()
 
-# --- MEMORIA DE TIEMPOS (Para calcular duración de caída) ---
-# Guardamos { "SN": "Hora de inicio de la caída" }
+# --- MEMORIA DE ESTADO ---
 if 'registro_caidas' not in st.session_state:
     st.session_state.registro_caidas = {}
+if 'alertas_enviadas' not in st.session_state:
+    st.session_state.alertas_enviadas = set()
 
-st.title("🛰️ Multinet NOC: Monitor de Cortes y Tiempos de Inactividad")
+st.title("🛰️ Multinet NOC: Inteligencia de Red Activa")
 
-# --- FUNCIONES ---
+# --- FUNCIONES NÚCLEO ---
 def enviar_tg(mensaje):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT, "text": mensaje, "parse_mode": "Markdown"}
@@ -41,16 +42,13 @@ def llamar_api(endpoint):
     except: return None
 
 def calcular_duracion(inicio, fin):
-    """Calcula la diferencia de tiempo amigable"""
     diff = fin - inicio
-    horas, rem = divmod(diff.total_seconds(), 3600)
-    minutos, _ = divmod(rem, 60)
-    if horas > 0:
-        return f"{int(horas)}h {int(minutos)}m"
-    return f"{int(minutos)}m"
+    h, rem = divmod(diff.total_seconds(), 3600)
+    m, _ = divmod(rem, 60)
+    return f"{int(h)}h {int(m)}m" if h > 0 else f"{int(m)}m"
 
-# --- PROCESO DE DATOS ---
-with st.spinner('Analizando historial de estados...'):
+# --- PROCESO ANALÍTICO ---
+with st.spinner('Analizando patrones de falla...'):
     onus = llamar_api("onu/get_onus_statuses")
     zonas_raw = llamar_api("system/get_zones")
     olts = llamar_api("system/get_olts")
@@ -59,99 +57,102 @@ if onus is not None:
     df = pd.DataFrame(onus)
     df['PUERTO'] = "B" + df['board'].astype(str) + "/P" + df['port'].astype(str)
     df['CLIENTE'] = df['onu'].fillna(df['sn'])
-    
-    # 1. Unir con nombres de Zonas
-    if zonas_raw:
-        df_z = pd.DataFrame(zonas_raw)
+    ahora_dt = datetime.now()
+
+    # 1. Mapeo de Zonas
+    df_z = pd.DataFrame(zonas_raw) if zonas_raw else pd.DataFrame()
+    if not df_z.empty:
         df_z['id'] = df_z['id'].astype(str)
         df['zone_id'] = df['zone_id'].astype(str)
         df = pd.merge(df, df_z[['id', 'name']], left_on='zone_id', right_on='id', how='left')
         df['ZONA_TXT'] = df['name'].fillna("Sin Zona")
     else:
-        df['ZONA_TXT'] = "Zona ID: " + df['zone_id'].astype(str)
+        df['ZONA_TXT'] = "Zona " + df['zone_id'].astype(str)
 
-    # --- LÓGICA DE ALERTAS Y TIEMPOS ---
-    ahora_dt = datetime.now()
+    # 2. IDENTIFICACIÓN DE FALLAS MASIVAS (Inteligencia)
     df_off = df[df['status'].str.lower() != 'online'].copy()
+    
+    # Agrupamos por OLT y Puerto para detectar fallas de infraestructura
+    fallas_por_puerto = df_off.groupby(['olt_id', 'PUERTO']).size().reset_index(name='cuenta')
+    puertos_masivos = fallas_por_puerto[fallas_por_puerto['cuenta'] >= 3] # Umbral: 3 ONUs
 
-    for _, row in df.iterrows():
+    # --- LÓGICA DE NOTIFICACIÓN INTELIGENTE ---
+    # Revisamos cada puerto con falla masiva
+    for _, f in puertos_masivos.iterrows():
+        id_alerta = f"MASSIVE_{f['olt_id']}_{f['PUERTO']}"
+        if id_alerta not in st.session_state.alertas_enviadas:
+            df_p = df_off[(df_off['olt_id'] == f['olt_id']) & (df_off['PUERTO'] == f['PUERTO'])]
+            zona_p = df_p['ZONA_TXT'].iloc[0]
+            
+            msg = f"💥 *FALLA MASIVA DETECTADA*\n"
+            msg += f"📍 *Zona:* {zona_p}\n"
+            msg += f"🏢 *OLT:* {f['olt_id']}\n"
+            msg += f"🔌 *Puerto:* {f['PUERTO']}\n"
+            msg += f"📉 *Impacto:* {f['cuenta']} clientes afectados.\n"
+            msg += f"⚠️ *Diagnóstico:* Posible corte de fibra o falla de energía en el sector."
+            enviar_tg(msg)
+            st.session_state.alertas_enviadas.add(id_alerta)
+
+    # Revisamos caídas individuales
+    for _, row in df_off.iterrows():
         sn = row['sn']
-        nombre = row['CLIENTE']
-        zona = row['ZONA_TXT']
         status = str(row['status']).lower()
-        es_online = status == 'online'
+        
+        # Si no es parte de una falla masiva ya reportada
+        id_p = f"MASSIVE_{row['olt_id']}_{row['PUERTO']}"
+        if id_p not in st.session_state.alertas_enviadas:
+            if sn not in st.session_state.registro_caidas:
+                st.session_state.registro_caidas[sn] = ahora_dt
+                
+                # Inteligencia de causa
+                causa = "Desconexión de Equipo (Manual/Energía)" if "pwfail" in status or "dying" in status else "Falla de Fibra Drop (LOS)"
+                
+                msg = f"👤 *FALLA INDIVIDUAL*\n"
+                msg += f"📝 *ID:* {row['CLIENTE']}\n"
+                msg += f"🆔 *SN:* `{sn}`\n"
+                msg += f"📍 *Zona:* {row['ZONA_TXT']}\n"
+                msg += f"❓ *Posible causa:* {causa}"
+                enviar_tg(msg)
 
-        # DETECTAR NUEVA CAÍDA
-        if not es_online and sn not in st.session_state.registro_caidas:
-            # Guardamos la hora de inicio (Desde cuándo está caído)
-            st.session_state.registro_caidas[sn] = ahora_dt
-            
-            msg = f"🔴 *FALLA DETECTADA*\n"
-            msg += f"👤 *Cliente:* {nombre}\n"
-            msg += f"🆔 *SN:* `{sn}`\n"
-            msg += f"📍 *Zona:* {zona}\n"
-            msg += f"🔌 *Puerto:* {row['PUERTO']}\n"
-            msg += f"⏱ *Desde:* {ahora_dt.strftime('%H:%M')}"
-            enviar_tg(msg)
-
-        # DETECTAR RECUPERACIÓN (Cálculo de tiempo total)
-        elif es_online and sn in st.session_state.registro_caidas:
+    # 3. LÓGICA DE RECUPERACIÓN (SLA)
+    for sn in list(st.session_state.registro_caidas.keys()):
+        # Si el cliente ya no está en la lista de offline
+        if sn not in df_off['sn'].values:
             hora_inicio = st.session_state.registro_caidas[sn]
-            tiempo_fuera = calcular_duracion(hora_inicio, ahora_dt)
+            duracion = calcular_duracion(hora_inicio, ahora_dt)
+            cliente_info = df[df['sn'] == sn].iloc[0]
             
-            msg = f"✅ *SERVICIO RESTABLECIDO*\n"
-            msg += f"👤 *Cliente:* {nombre}\n"
-            msg += f"🆔 *SN:* `{sn}`\n"
-            msg += f"📍 *Zona:* {zona}\n"
-            msg += f"⏳ *Tiempo fuera:* {tiempo_fuera}\n"
-            msg += f"✨ *Estado:* Online ahora."
+            msg = f"✅ *SERVICIO RECUPERADO*\n"
+            msg += f"👤 *Cliente:* {cliente_info['CLIENTE']}\n"
+            msg += f"⏳ *Tiempo Offline:* {duracion}\n"
+            msg += f"📍 *Zona:* {cliente_info['ZONA_TXT']}"
             enviar_tg(msg)
-            
-            # Limpiamos de la memoria de caídas
             del st.session_state.registro_caidas[sn]
 
-    # --- REPORTE GLOBAL (Similar a la imagen de PON Outage) ---
-    with st.sidebar:
-        if st.button("🚀 Enviar Reporte Global de Outages"):
-            if not df_off.empty:
-                reporte = f"📡 *PON OUTAGE REPORT*\n"
-                reporte += "----------------------------------\n"
-                # Agrupamos por OLT y Puerto
-                for olt_id in df_off['olt_id'].unique():
-                    nombre_olt = next((o.get('name') for o in olts if str(o.get('id')) == str(olt_id)), olt_id) if olts else olt_id
-                    reporte += f"🏢 *OLT:* {nombre_olt}\n"
-                    
-                    df_p_off = df_off[df_off['olt_id'] == olt_id]
-                    for p in df_p_off['PUERTO'].unique():
-                        df_final = df_p_off[df_p_off['PUERTO'] == p]
-                        zona_p = df_final['ZONA_TXT'].iloc[0]
-                        # Calculamos tiempo promedio de este grupo
-                        reporte += f"  📍 *Zona:* {zona_p}\n"
-                        reporte += f"  🔌 *Port:* {p} ({len(df_final)} ONUs)\n"
-                        reporte += f"  👤 *IDs:* {', '.join(df_final['CLIENTE'].astype(str).tolist())}\n"
-                    reporte += "\n"
-                enviar_tg(reporte)
-            else:
-                enviar_tg("✅ *RED OK:* No se detectan puertos con fallas.")
+    # Limpiar alertas masivas si el puerto se recupera
+    for alert_id in list(st.session_state.alertas_enviadas):
+        if alert_id.startswith("MASSIVE"):
+            _, olt, port = alert_id.split("_", 2)
+            # Si ya no hay falla masiva en ese puerto (menos de 2 caídos)
+            if len(df_off[(df_off['olt_id'] == olt) & (df_off['PUERTO'] == port)]) < 2:
+                enviar_tg(f"✅ *PUERTO RESTABLECIDO*\nEl puerto {port} en OLT {olt} vuelve a estar operativo.")
+                st.session_state.alertas_enviadas.remove(alert_id)
 
-    # --- DASHBOARD VISUAL ---
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Online ✅", len(df) - len(df_off))
-    k2.metric("Offline 🔴", len(df_off), delta_color="inverse")
-    k3.metric("Fallas de Puerto", len(df_off['PUERTO'].unique()) if not df_off.empty else 0)
+    # --- INTERFAZ VISUAL ---
+    st.subheader("📋 Resumen de Inteligencia")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Online ✅", len(df) - len(df_off))
+    c2.metric("Offline ❌", len(df_off), delta_color="inverse")
+    c3.metric("Fallas Masivas", len(puertos_masivos), delta_color="inverse")
 
-    st.subheader("📋 Estado Detallado (Similar a SmartOLT)")
-    df['Downtime'] = df['sn'].apply(lambda x: calcular_duracion(st.session_state.registro_caidas[x], ahora_dt) if x in st.session_state.registro_caidas else "---")
-    
     st.dataframe(
-        df[['status', 'CLIENTE', 'sn', 'ZONA_TXT', 'PUERTO', 'Downtime']].rename(
-            columns={'status': 'Estado', 'CLIENTE': 'Nombre (Name)', 'Downtime': 'Tiempo Caído'}
-        ),
-        use_container_width=True, hide_index=True
+        df[['status', 'CLIENTE', 'sn', 'ZONA_TXT', 'PUERTO']].rename(
+            columns={'status': 'Estado SmartOLT', 'CLIENTE': 'Nombre/ID'}
+        ), use_container_width=True, hide_index=True
     )
 
 else:
-    st.error("Error al conectar con SmartOLT.")
+    st.error("No se pudo conectar a SmartOLT.")
 
 time.sleep(60)
 st.rerun()
